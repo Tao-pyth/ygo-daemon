@@ -39,6 +39,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
+from requests import Response
+from requests.exceptions import RequestException
 
 
 # =========================
@@ -50,6 +52,9 @@ API_DBVER = "https://db.ygoprodeck.com/api/v7/checkDBVer.php"
 RUN_INTERVAL_SLEEP_SEC = 0.6  # API呼び出し間隔（秒）: 0.6秒=約1.6req/s（保守的）
 JITTER_SEC = 0.2              # ランダム揺らぎ（秒）
 HTTP_TIMEOUT_SEC = 30
+RETRY_MAX_ATTEMPTS = 5
+RETRY_BASE_SEC = 0.5
+RETRY_MAX_SEC = 8.0
 
 FULLSYNC_PAGE_SIZE = 200      # 全件同期の1ページ件数
 MAX_QUEUE_ITEMS_PER_RUN = 1   # 1回の起動でキューを何件消化するか
@@ -125,14 +130,50 @@ class ApiClient:
         self.session = requests.Session()
         self.api_calls = 0
 
+    def _calc_backoff(self, attempt: int) -> float:
+        capped_attempt = max(1, attempt)
+        return min(RETRY_MAX_SEC, RETRY_BASE_SEC * (2 ** (capped_attempt - 1)))
+
+    def _should_retry(self, response: Optional[Response], error: Optional[Exception]) -> bool:
+        if error is not None:
+            return True
+        if response is None:
+            return False
+        return response.status_code in (429, 500, 502, 503, 504)
+
     def _get_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         if self.api_calls >= MAX_API_CALLS_PER_RUN:
             raise RuntimeError("API呼び出し上限に到達しました（暴走防止）")
-        sleep_rate()
-        self.api_calls += 1
-        r = self.session.get(url, params=params, timeout=HTTP_TIMEOUT_SEC)
-        r.raise_for_status()
-        return r.json()
+
+        last_error: Optional[Exception] = None
+        last_response: Optional[Response] = None
+
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+            sleep_rate()
+            self.api_calls += 1
+            try:
+                response = self.session.get(url, params=params, timeout=HTTP_TIMEOUT_SEC)
+                last_response = response
+                response.raise_for_status()
+                return response.json()
+            except RequestException as err:
+                last_error = err
+                if not self._should_retry(last_response, err):
+                    raise
+
+            if attempt == RETRY_MAX_ATTEMPTS:
+                break
+
+            backoff_sec = self._calc_backoff(attempt)
+            time.sleep(backoff_sec)
+
+            if self.api_calls >= MAX_API_CALLS_PER_RUN:
+                raise RuntimeError("API呼び出し上限に到達しました（暴走防止）")
+
+        if last_error is not None:
+            raise RuntimeError(f"API呼び出し失敗（retries exhausted）: {last_error}")
+
+        raise RuntimeError("API呼び出しに失敗しました（レスポンス不正）")
 
     def check_dbver(self) -> Dict[str, Any]:
         return self._get_json(API_DBVER, {})
