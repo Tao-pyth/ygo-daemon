@@ -385,6 +385,8 @@ def step_check_dbver(con: sqlite3.Connection, api: ApiClient) -> str:
 
     old = kv_get(con, "dbver_hash")
     if old != h:
+        # NOTE(引き継ぎ): dbver変化時は「既存カードを段階再取得」するためのトリガだけ立てる。
+        # ここで即時に全件API再取得しないのは、1回実行での処理量を制御するため。
         kv_set(con, "dbver_hash", h)
         kv_set(con, "dbver_changed", "1")
         con.commit()
@@ -441,6 +443,8 @@ def mark_need_fetch_by_konami_id(con: sqlite3.Connection, konami_id: int) -> Non
 
 
 def enqueue_need_fetch_cards(con: sqlite3.Connection, limit: int) -> int:
+    # NOTE(引き継ぎ): queue優先設計を守るため、PENDING重複投入を避けつつ小分けで再投入する。
+    # limitで1runあたりの投入上限をかけ、Task Scheduler想定の漸進同期に寄せている。
     candidates = con.execute(
         """
         SELECT DISTINCT cr.konami_id
@@ -692,6 +696,8 @@ def run_once() -> int:
         dbver_hash = step_check_dbver(con, api)
 
         if kv_get(con, "dbver_changed", "0") == "1":
+            # NOTE(引き継ぎ): dbver差分検知後はfetch_statusをNEED_FETCHに戻すだけ。
+            # 実際の再取得はキュー経由で少しずつ進める（処理時間のスパイク回避）。
             con.execute("UPDATE cards_raw SET fetch_status='NEED_FETCH' WHERE konami_id IS NOT NULL")
             kv_set(con, "dbver_changed", "0")
             con.commit()
@@ -699,6 +705,8 @@ def run_once() -> int:
         queue_requeue_errors(con)
 
         if not queue_has_pending(con):
+            # NOTE(引き継ぎ): 現在の実装は「キューが空ならNEED_FETCHを再投入」まで。
+            # 仕様書にあるoffsetベースのfull sync(1ページ進行)は別途接続が必要。
             enqueue_need_fetch_cards(con, MAX_NEED_FETCH_ENQUEUE_PER_RUN)
 
         # B) キュー優先
