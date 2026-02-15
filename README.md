@@ -6,15 +6,15 @@ YGOPRODeck API v7 からカード情報を定期同期する Python デーモン
 
 - `cardinfo.php` を `misc=yes` 付きで取得
 - API から受け取ったカード JSON を `cards_raw.json` 列へロスレス保存
-- `KONAMI_ID` キュー処理を優先し、空のときだけ全件同期（`num`/`offset`）を進める
-- JSONL ステージング後に SQLite へバッチ取り込み
+- `KONAMI_ID` キュー処理を優先し、空のときだけ `NEED_FETCH` / `ERROR` の差分再取得を進める
+- JSONL ステージング後に SQLite へバッチ取り込み（取り込み後は JSONL を削除）
 
 ## セットアップ
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
 
 ## 実行方法
@@ -36,6 +36,4 @@ ruff check .
 
 - `data/state/` : SQLite DB、ロックファイル
 - `data/staging/` : API 取得直後の JSONL
-- `data/staged/` : 取り込み成功済み JSONL
-- `data/failed/` : 取り込み失敗 JSONL
-- `data/logs/` : ログ用ディレクトリ
+- `data/logs/` : ERRORログ（ローテーション有効）

@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YGOPRODeck API v7 定期取得デーモン（Neo4j文言なし・SQLite二層保存）
-- cards_raw: APIの1カード分JSONをロスなく保存（原本）
-- cards_index: 検索用に主要項目だけ抽出して保存（索引）
-- request_queue: 初期実装は KONAMI_ID キュー（最優先で消化）
-- unknown取得（全件同期）: num/offsetカーソルを1ページずつ進める
-- 外部取得結果はJSONLに蓄積し、溜まった分をSQLiteへ一括取り込み
-
-使い方（例）
-  1) 初期化:
-     python ygo_daemon_onefile.py initdb
-
-  2) キュー追加（KONAMI_ID）:
-     python ygo_daemon_onefile.py queue-add --konami-id 12345678
-
-  3) 1回実行（タスクスケジューラで定期起動する想定）:
-     python ygo_daemon_onefile.py run
-
-依存:
-  pip install requests
+YGOPRODeck API v7 定期取得デーモン
+- cards_raw: APIカードJSONをロスレス保存
+- cards_index: 検索向け索引
+- request_queue: KONAMI_IDキューを最優先で最大100件処理
+- dbver変更時は cards_raw.fetch_status を NEED_FETCH へ更新し段階的に再取得
+- JSONL取り込み成否に関わらず中間ファイルは削除
 """
 
 from __future__ import annotations
@@ -27,14 +14,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
+import logging
 import random
-import shutil
 import sqlite3
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -56,22 +43,21 @@ RETRY_MAX_ATTEMPTS = 5
 RETRY_BASE_SEC = 0.5
 RETRY_MAX_SEC = 8.0
 
-FULLSYNC_PAGE_SIZE = 200      # 全件同期の1ページ件数
-MAX_QUEUE_ITEMS_PER_RUN = 1   # 1回の起動でキューを何件消化するか
-MAX_FULLSYNC_PAGES_PER_RUN = 1
-MAX_API_CALLS_PER_RUN = 8     # 暴走防止（キュー＋全件同期＋dbverを含めても良い上限）
+MAX_QUEUE_ITEMS_PER_RUN = 100
+MAX_NEED_FETCH_ENQUEUE_PER_RUN = 100
+MAX_API_CALLS_PER_RUN = 120   # 100件処理 + dbver確認を想定した上限
 
 # ディレクトリ
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 STATE_DIR = DATA_DIR / "state"
 STAGING_DIR = DATA_DIR / "staging"
-STAGED_DIR = DATA_DIR / "staged"
-FAILED_DIR = DATA_DIR / "failed"
 LOG_DIR = DATA_DIR / "logs"
 
 DB_PATH = STATE_DIR / "crawl.sqlite3"
 LOCK_PATH = STATE_DIR / "run.lock"
+
+LOGGER = logging.getLogger("ygo-daemon")
 
 
 # =========================
@@ -82,8 +68,25 @@ def now_iso() -> str:
 
 
 def ensure_dirs() -> None:
-    for p in [DATA_DIR, STATE_DIR, STAGING_DIR, STAGED_DIR, FAILED_DIR, LOG_DIR]:
+    for p in [DATA_DIR, STATE_DIR, STAGING_DIR, LOG_DIR]:
         p.mkdir(parents=True, exist_ok=True)
+
+
+def configure_logging() -> None:
+    ensure_dirs()
+    if LOGGER.handlers:
+        return
+
+    LOGGER.setLevel(logging.INFO)
+    handler = RotatingFileHandler(
+        LOG_DIR / "daemon.log",
+        maxBytes=1_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setLevel(logging.ERROR)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    LOGGER.addHandler(handler)
 
 
 def acquire_lock() -> bool:
@@ -226,7 +229,8 @@ CREATE TABLE IF NOT EXISTS cards_raw(
   content_hash TEXT NOT NULL,
   fetched_at TEXT NOT NULL,
   dbver_hash TEXT,
-  source TEXT NOT NULL            -- queue/full_sync
+  source TEXT NOT NULL,           -- queue/full_sync
+  fetch_status TEXT NOT NULL DEFAULT 'OK'
 );
 
 -- 検索用索引（必要最小限）
@@ -270,6 +274,14 @@ def db_connect() -> sqlite3.Connection:
 
 def ensure_schema(con: sqlite3.Connection) -> None:
     con.executescript(DDL)
+
+    columns = {
+        row["name"]
+        for row in con.execute("PRAGMA table_info(cards_raw)").fetchall()
+    }
+    if "fetch_status" not in columns:
+        con.execute("ALTER TABLE cards_raw ADD COLUMN fetch_status TEXT NOT NULL DEFAULT 'OK'")
+
     con.commit()
 
 
@@ -373,10 +385,8 @@ def step_check_dbver(con: sqlite3.Connection, api: ApiClient) -> str:
 
     old = kv_get(con, "dbver_hash")
     if old != h:
-        # 更新があったら全件同期をやり直し（要件に合わせて初期化）
         kv_set(con, "dbver_hash", h)
-        kv_set(con, "sync_offset", "0")
-        kv_set(con, "full_sync_done", "0")
+        kv_set(con, "dbver_changed", "1")
         con.commit()
 
     return h
@@ -399,19 +409,65 @@ def queue_pick_next(con: sqlite3.Connection) -> Optional[sqlite3.Row]:
     ).fetchone()
 
 
+def queue_has_pending(con: sqlite3.Connection) -> bool:
+    row = con.execute("SELECT 1 FROM request_queue WHERE state='PENDING' LIMIT 1").fetchone()
+    return row is not None
+
+
+def queue_requeue_errors(con: sqlite3.Connection) -> None:
+    con.execute("UPDATE request_queue SET state='PENDING' WHERE state='ERROR'")
+    con.commit()
+
+
 def queue_mark_done(con: sqlite3.Connection, qid: int) -> None:
     con.execute("UPDATE request_queue SET state='DONE' WHERE id=?", (qid,))
     con.commit()
 
 
-def queue_mark_error(con: sqlite3.Connection, qid: int, err: str) -> None:
-    # 失敗時はattemptsを増やし、今回はPENDINGのままでも良いが、
-    # 調査しやすいようERRORへ落とす（運用で好み変更可）
+def queue_mark_retry(con: sqlite3.Connection, qid: int, err: str) -> None:
     con.execute(
         "UPDATE request_queue SET state='ERROR', attempts=attempts+1, last_error=? WHERE id=?",
         (err[:2000], qid),
     )
     con.commit()
+
+
+def mark_need_fetch_by_konami_id(con: sqlite3.Connection, konami_id: int) -> None:
+    con.execute(
+        "UPDATE cards_raw SET fetch_status='NEED_FETCH' WHERE konami_id=?",
+        (konami_id,),
+    )
+    con.commit()
+
+
+def enqueue_need_fetch_cards(con: sqlite3.Connection, limit: int) -> int:
+    candidates = con.execute(
+        """
+        SELECT DISTINCT cr.konami_id
+        FROM cards_raw cr
+        WHERE cr.konami_id IS NOT NULL
+          AND cr.fetch_status IN ('NEED_FETCH', 'ERROR')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM request_queue q
+              WHERE q.konami_id=cr.konami_id AND q.state='PENDING'
+          )
+        ORDER BY cr.fetched_at ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    if not candidates:
+        return 0
+
+    added_at = now_iso()
+    con.executemany(
+        "INSERT INTO request_queue(konami_id, state, attempts, added_at) VALUES(?,?,?,?)",
+        [(int(row["konami_id"]), "PENDING", 0, added_at) for row in candidates],
+    )
+    con.commit()
+    return len(candidates)
 
 
 def staging_write_cards(cards: List[Dict[str, Any]], source: str) -> Optional[Path]:
@@ -444,9 +500,9 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
             queue_mark_done(con, qid)
             done += 1
         except Exception as e:
-            queue_mark_error(con, qid, str(e))
-            # キューは優先なので、エラーでも次へ進まず終了（好み）
-            break
+            LOGGER.error("queue item failed (qid=%s, konami_id=%s): %s", qid, konami_id, e)
+            queue_mark_retry(con, qid, str(e))
+            mark_need_fetch_by_konami_id(con, konami_id)
 
     return done
 
@@ -454,36 +510,8 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
 # =========================
 # ステップC：全件同期（未知取得アルゴリズム）→ JSONL蓄積
 # =========================
-def step_fullsync_one_or_more_pages(con: sqlite3.Connection, api: ApiClient, dbver_hash: str) -> int:
-    pages = 0
-    if kv_get(con, "full_sync_done", "0") == "1":
-        return 0
-
-    offset = int(kv_get(con, "sync_offset", "0") or "0")
-
-    for _ in range(MAX_FULLSYNC_PAGES_PER_RUN):
-        res = api.cardinfo_fullsync_page(offset=offset, num=FULLSYNC_PAGE_SIZE)
-        staging_write_cards(res.data, source="fullsync")
-
-        meta = res.meta or {}
-        next_off = meta.get("next_page_offset")
-
-        if next_off is None:
-            kv_set(con, "full_sync_done", "1")
-            con.commit()
-            pages += 1
-            break
-
-        offset = int(next_off)
-        kv_set(con, "sync_offset", str(offset))
-        con.commit()
-        pages += 1
-
-    return pages
-
-
 # =========================
-# ステップD：JSONL → SQLite 一括取り込み
+# ステップC：JSONL → SQLite 一括取り込み
 # =========================
 def ingest_register_pending(con: sqlite3.Connection, path: Path) -> None:
     con.execute(
@@ -528,7 +556,8 @@ def upsert_card_rows(con: sqlite3.Connection, card: Dict[str, Any], dbver_hash: 
           content_hash=excluded.content_hash,
           fetched_at=excluded.fetched_at,
           dbver_hash=excluded.dbver_hash,
-          source=excluded.source
+          source=excluded.source,
+          fetch_status='OK'
         """,
         (card_id, konami_id, raw_json_text, h, now_iso(), dbver_hash, source),
     )
@@ -617,17 +646,6 @@ def ingest_finalize(con: sqlite3.Connection, path: Path, status: str, err: Optio
     con.commit()
 
 
-def move_file(src: Path, dst_dir: Path) -> None:
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / src.name
-    # 既にあればユニーク化
-    if dst.exists():
-        stem = src.stem
-        suf = src.suffix
-        dst = dst_dir / f"{stem}_{int(time.time())}{suf}"
-    shutil.move(str(src), str(dst))
-
-
 def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
     # stagingをスキャンして ingest_filesへ登録
     ingest_scan_and_register(con)
@@ -646,10 +664,10 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
 
         if err is None:
             ingest_finalize(con, path, status="DONE", err=None)
-            move_file(path, STAGED_DIR)
         else:
+            LOGGER.error("ingest failed path=%s err=%s", path, err)
             ingest_finalize(con, path, status="FAILED", err=err)
-            move_file(path, FAILED_DIR)
+        path.unlink(missing_ok=True)
 
     return total
 
@@ -658,6 +676,7 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
 # runner（1回実行）
 # =========================
 def run_once() -> int:
+    configure_logging()
     if not acquire_lock():
         print("[SKIP] 既に実行中の可能性があるため終了します。")
         return 0
@@ -672,24 +691,30 @@ def run_once() -> int:
         # A) DB更新検知
         dbver_hash = step_check_dbver(con, api)
 
+        if kv_get(con, "dbver_changed", "0") == "1":
+            con.execute("UPDATE cards_raw SET fetch_status='NEED_FETCH' WHERE konami_id IS NOT NULL")
+            kv_set(con, "dbver_changed", "0")
+            con.commit()
+
+        queue_requeue_errors(con)
+
+        if not queue_has_pending(con):
+            enqueue_need_fetch_cards(con, MAX_NEED_FETCH_ENQUEUE_PER_RUN)
+
         # B) キュー優先
         q_done = step_consume_queue(con, api, dbver_hash=dbver_hash)
 
-        # C) キューが空なら全件同期を進める
-        pages = 0
-        if q_done == 0:
-            pages = step_fullsync_one_or_more_pages(con, api, dbver_hash=dbver_hash)
-
-        # D) SQLite一括取り込み
+        # C) SQLite一括取り込み
         ingested = step_ingest_sqlite(con, dbver_hash=dbver_hash)
 
         kv_set(con, "last_run_at", now_iso())
         con.commit()
 
-        print(f"[OK] run: queue_done={q_done}, fullsync_pages={pages}, ingested_cards={ingested}, api_calls={api.api_calls}")
+        print(f"[OK] run: queue_done={q_done}, ingested_cards={ingested}, api_calls={api.api_calls}")
         return 0
 
     except Exception as e:
+        LOGGER.error("run failed: %s", e)
         print(f"[ERROR] {e}")
         return 1
 
