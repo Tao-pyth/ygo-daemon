@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-import requests
 
 import main
 
@@ -15,7 +14,7 @@ class DummyResponse:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            raise requests.HTTPError(f"status={self.status_code}")
+            raise main.RequestException(f"status={self.status_code}")
 
     def json(self) -> dict[str, Any]:
         return self._payload
@@ -40,12 +39,13 @@ def test_extract_konami_id_from_misc_info() -> None:
 
 
 def test_get_json_retries_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = main.ApiClient()
-    client.session = DummySession(
-        [
-            requests.Timeout("timeout"),
-            DummyResponse(status_code=200, payload={"ok": True}),
-        ]
+    client = main.ApiClient(
+        session=DummySession(
+            [
+                main.RequestException("timeout"),
+                DummyResponse(status_code=200, payload={"ok": True}),
+            ]
+        )
     )
     monkeypatch.setattr(main, "sleep_rate", lambda: None)
     monkeypatch.setattr(main.time, "sleep", lambda _: None)
@@ -57,8 +57,7 @@ def test_get_json_retries_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_get_json_fails_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = main.ApiClient()
-    client.session = DummySession([requests.Timeout("timeout")] * main.RETRY_MAX_ATTEMPTS)
+    client = main.ApiClient(session=DummySession([main.RequestException("timeout")] * main.RETRY_MAX_ATTEMPTS))
     monkeypatch.setattr(main, "sleep_rate", lambda: None)
     monkeypatch.setattr(main.time, "sleep", lambda _: None)
 

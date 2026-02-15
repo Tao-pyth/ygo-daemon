@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import random
 import shutil
 import sqlite3
@@ -36,11 +35,18 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from requests import Response
-from requests.exceptions import RequestException
+try:
+    import requests
+    from requests import Response
+    from requests.exceptions import RequestException
+except ModuleNotFoundError:  # pragma: no cover - requests未導入環境向けのフォールバック
+    requests = None  # type: ignore[assignment]
+    Response = Any  # type: ignore[misc,assignment]
+
+    class RequestException(Exception):
+        """requests未導入時でもリトライ分岐を維持するための代替例外。"""
 
 
 # =========================
@@ -126,8 +132,13 @@ class ApiResult:
 
 
 class ApiClient:
-    def __init__(self) -> None:
-        self.session = requests.Session()
+    def __init__(self, session: Any | None = None) -> None:
+        if session is not None:
+            self.session = session
+        else:
+            if requests is None:
+                raise RuntimeError("requests が未インストールです。`pip install -r requirements.txt` を実行してください。")
+            self.session = requests.Session()
         self.api_calls = 0
 
     def _calc_backoff(self, attempt: int) -> float:
