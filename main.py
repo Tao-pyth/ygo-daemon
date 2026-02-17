@@ -371,6 +371,8 @@ def queue_has_pending(con: sqlite3.Connection) -> bool:
 
 
 def queue_requeue_errors(con: sqlite3.Connection) -> None:
+    # NOTE(引き継ぎ): ERRORを次回以降に再挑戦させる。
+    # ここで握りつぶさず再投入しておくことで、APIの一時障害に強くする。
     con.execute("UPDATE request_queue SET state='PENDING' WHERE state='ERROR'")
     con.commit()
 
@@ -702,6 +704,9 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
         else:
             LOGGER.error("ingest failed path=%s err=%s", path, err)
             ingest_finalize(con, path, status="FAILED", err=err)
+
+        # NOTE(引き継ぎ): 現行仕様では ingest 成否に関わらず staging を削除する。
+        # 失敗時の再調査性を上げるには failed/ へ退避する実装へ置き換えること。
         path.unlink(missing_ok=True)
 
     return total
