@@ -44,6 +44,8 @@ def applied_versions(con: sqlite3.Connection) -> set[int]:
 
 
 def _execute_sql_script(con: sqlite3.Connection, sql: str) -> None:
+    # NOTE(引き継ぎ): sqlite3.executescript では1文ごとの制御がしづらいため、
+    # complete_statement で区切って順に実行している。
     statement = ""
     for line in sql.splitlines(keepends=True):
         statement += line
@@ -58,6 +60,8 @@ def _execute_sql_script(con: sqlite3.Connection, sql: str) -> None:
         con.execute(rest)
 
 def apply_migrations(con: sqlite3.Connection, migrations_dir: Path) -> int:
+    # NOTE(引き継ぎ): マイグレーション全体を1トランザクションで適用し、
+    # 途中失敗時はロールバックして中途半端な状態を避ける。
     ensure_migrations_table(con)
 
     migrations = list_migrations(migrations_dir)

@@ -83,6 +83,8 @@ def _extract_image_url(card: dict[str, Any]) -> str | None:
 
 
 def parse_cards(response_json: dict[str, Any]) -> list[CardDTO]:
+    # NOTE(引き継ぎ): parse段階では欠損値を許容し、
+    # DB投入の直前まで落とさない方針にしている（原本保存を優先）。
     data = response_json.get("data")
     if not isinstance(data, list):
         return []
@@ -160,6 +162,8 @@ def fetch_keyword_cards(
 
 
 def upsert_card(con: sqlite3.Connection, card: CardDTO) -> None:
+    # NOTE(引き継ぎ): raw_text は API原本をそのまま保存する用途。
+    # canonical は比較ハッシュ専用で、保存データの置換には使わない。
     raw_text = json.dumps(card.raw_json, ensure_ascii=False)
     canonical = json.dumps(card.raw_json, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
