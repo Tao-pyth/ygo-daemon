@@ -29,6 +29,8 @@ import requests
 from requests import Response
 from requests.exceptions import RequestException
 
+from app.infra.migrate import apply_migrations
+
 
 # =========================
 # 設定（必要ならここだけ調整）
@@ -203,86 +205,20 @@ class ApiClient:
 # =========================
 # SQLite（状態管理 + ロスレス保存）
 # =========================
-DDL = """
-PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS kv_store(
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
--- 初期実装：KONAMI_IDキュー
-CREATE TABLE IF NOT EXISTS request_queue(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  konami_id INTEGER NOT NULL,
-  state TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING/DONE/ERROR
-  attempts INTEGER NOT NULL DEFAULT 0,
-  added_at TEXT NOT NULL,
-  last_error TEXT
-);
-
--- 原本（ロスレス保存）
-CREATE TABLE IF NOT EXISTS cards_raw(
-  card_id INTEGER PRIMARY KEY,
-  konami_id INTEGER,
-  json TEXT NOT NULL,             -- 生JSON丸ごと（ロスなく）
-  content_hash TEXT NOT NULL,
-  fetched_at TEXT NOT NULL,
-  dbver_hash TEXT,
-  source TEXT NOT NULL,           -- queue/full_sync
-  fetch_status TEXT NOT NULL DEFAULT 'OK'
-);
-
--- 検索用索引（必要最小限）
-CREATE TABLE IF NOT EXISTS cards_index(
-  card_id INTEGER PRIMARY KEY,
-  konami_id INTEGER,
-  name TEXT,
-  type TEXT,
-  race TEXT,
-  attribute TEXT,
-  level INTEGER,
-  atk INTEGER,
-  def INTEGER,
-  archetype TEXT,
-  ban_tcg TEXT,
-  ban_ocg TEXT,
-  updated_at TEXT NOT NULL
-);
-
--- 取り込みファイル管理（任意だが堅牢）
-CREATE TABLE IF NOT EXISTS ingest_files(
-  path TEXT PRIMARY KEY,
-  status TEXT NOT NULL,           -- PENDING/DONE/FAILED
-  added_at TEXT NOT NULL,
-  processed_at TEXT,
-  last_error TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_queue_state ON request_queue(state, id);
-CREATE INDEX IF NOT EXISTS idx_raw_konami ON cards_raw(konami_id);
-CREATE INDEX IF NOT EXISTS idx_index_konami ON cards_index(konami_id);
-"""
+MIGRATIONS_DIR = ROOT / "app" / "db" / "migrations"
 
 
 def db_connect() -> sqlite3.Connection:
     ensure_dirs()
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA foreign_keys=ON")
     return con
 
 
 def ensure_schema(con: sqlite3.Connection) -> None:
-    con.executescript(DDL)
-
-    columns = {
-        row["name"]
-        for row in con.execute("PRAGMA table_info(cards_raw)").fetchall()
-    }
-    if "fetch_status" not in columns:
-        con.execute("ALTER TABLE cards_raw ADD COLUMN fetch_status TEXT NOT NULL DEFAULT 'OK'")
-
-    con.commit()
+    apply_migrations(con, MIGRATIONS_DIR)
 
 
 def kv_get(con: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -552,8 +488,8 @@ def upsert_card_rows(con: sqlite3.Connection, card: Dict[str, Any], dbver_hash: 
     # cards_raw: 原本保存
     con.execute(
         """
-        INSERT INTO cards_raw(card_id, konami_id, json, content_hash, fetched_at, dbver_hash, source)
-        VALUES(?,?,?,?,?,?,?)
+        INSERT INTO cards_raw(card_id, konami_id, json, content_hash, fetched_at, dbver_hash, source, fetch_status)
+        VALUES(?,?,?,?,?,?,?,?)
         ON CONFLICT(card_id) DO UPDATE SET
           konami_id=excluded.konami_id,
           json=excluded.json,
@@ -563,7 +499,7 @@ def upsert_card_rows(con: sqlite3.Connection, card: Dict[str, Any], dbver_hash: 
           source=excluded.source,
           fetch_status='OK'
         """,
-        (card_id, konami_id, raw_json_text, h, now_iso(), dbver_hash, source),
+        (card_id, konami_id, raw_json_text, h, now_iso(), dbver_hash, source, "OK"),
     )
 
     # cards_index: 検索用抽出
