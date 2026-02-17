@@ -42,7 +42,8 @@ def temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> sqlite3.Connecti
     monkeypatch.setattr(main, "STATE_DIR", main.DATA_DIR / "state")
     monkeypatch.setattr(main, "STAGING_DIR", main.DATA_DIR / "staging")
     monkeypatch.setattr(main, "LOG_DIR", main.DATA_DIR / "logs")
-    monkeypatch.setattr(main, "DB_PATH", main.STATE_DIR / "crawl.sqlite3")
+    monkeypatch.setattr(main, "DB_DIR", main.DATA_DIR / "db")
+    monkeypatch.setattr(main, "DB_PATH", main.DB_DIR / "ygo.sqlite3")
     monkeypatch.setattr(main, "LOCK_PATH", main.STATE_DIR / "run.lock")
 
     con = main.db_connect()
@@ -84,7 +85,7 @@ def test_get_json_fails_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_queue_mark_retry_sets_error_for_next_run(temp_db: sqlite3.Connection) -> None:
-    main.queue_add(temp_db, 1234)
+    main.queue_add(temp_db, konami_id=1234, keyword=None)
     row = main.queue_pick_next(temp_db)
     assert row is not None
 
@@ -95,6 +96,24 @@ def test_queue_mark_retry_sets_error_for_next_run(temp_db: sqlite3.Connection) -
     assert pending["c"] == 0
     assert errors["c"] == 1
 
+
+
+
+def test_queue_add_accepts_keyword(temp_db: sqlite3.Connection) -> None:
+    main.queue_add(temp_db, konami_id=None, keyword="Blue-Eyes")
+
+    row = temp_db.execute("SELECT konami_id, keyword, state FROM request_queue ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["konami_id"] is None
+    assert row["keyword"] == "Blue-Eyes"
+    assert row["state"] == "PENDING"
+
+
+def test_cli_queue_add_requires_exclusive_arg() -> None:
+    with pytest.raises(SystemExit):
+        main.main(["queue-add", "--konami-id", "1", "--keyword", "Blue-Eyes"])
+
+    with pytest.raises(SystemExit):
+        main.main(["queue-add"])
 
 def test_enqueue_need_fetch_cards_queues_only_candidates(temp_db: sqlite3.Connection) -> None:
     temp_db.execute(
