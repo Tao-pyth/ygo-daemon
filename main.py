@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import random
 import sqlite3
 import sys
@@ -55,9 +56,14 @@ DATA_DIR = ROOT / "data"
 STATE_DIR = DATA_DIR / "state"
 STAGING_DIR = DATA_DIR / "staging"
 LOG_DIR = DATA_DIR / "logs"
+IMAGE_DIR = DATA_DIR / "image" / "card"
+FAILED_IMAGE_DIR = DATA_DIR / "image" / "failed"
+DB_DIR = DATA_DIR / "db"
 
-DB_PATH = STATE_DIR / "crawl.sqlite3"
+DB_PATH = DB_DIR / "ygo.sqlite3"
 LOCK_PATH = STATE_DIR / "run.lock"
+LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", "INFO").upper()
+IMAGE_DOWNLOAD_LIMIT_PER_RUN = 30
 
 LOGGER = logging.getLogger("ygo-daemon")
 
@@ -70,7 +76,7 @@ def now_iso() -> str:
 
 
 def ensure_dirs() -> None:
-    for p in [DATA_DIR, STATE_DIR, STAGING_DIR, LOG_DIR]:
+    for p in [DATA_DIR, DB_DIR, STATE_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, FAILED_IMAGE_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -79,14 +85,14 @@ def configure_logging() -> None:
     if LOGGER.handlers:
         return
 
-    LOGGER.setLevel(logging.INFO)
+    LOGGER.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     handler = RotatingFileHandler(
         LOG_DIR / "daemon.log",
         maxBytes=1_000_000,
         backupCount=5,
         encoding="utf-8",
     )
-    handler.setLevel(logging.ERROR)
+    handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     LOGGER.addHandler(handler)
 
@@ -185,6 +191,15 @@ class ApiClient:
 
     def cardinfo_by_konami_id(self, konami_id: int) -> ApiResult:
         params = {"konami_id": str(konami_id), "misc": "yes"}
+        raw = self._get_json(API_CARDINFO, params)
+        return ApiResult(
+            data=list(raw.get("data") or []),
+            meta=dict(raw.get("meta") or {}),
+            raw=raw,
+        )
+
+    def cardinfo_by_keyword(self, keyword: str) -> ApiResult:
+        params = {"fname": keyword, "misc": "yes"}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
             data=list(raw.get("data") or []),
@@ -333,10 +348,13 @@ def step_check_dbver(con: sqlite3.Connection, api: ApiClient) -> str:
 # =========================
 # ステップB：キュー（KONAMI_ID）優先消化 → JSONL蓄積
 # =========================
-def queue_add(con: sqlite3.Connection, konami_id: int) -> None:
+def queue_add(con: sqlite3.Connection, *, konami_id: Optional[int], keyword: Optional[str]) -> None:
+    if (konami_id is None) == (keyword is None):
+        raise ValueError("Either konami_id or keyword must be set, but not both")
+
     con.execute(
-        "INSERT INTO request_queue(konami_id, state, attempts, added_at) VALUES(?,?,?,?)",
-        (konami_id, "PENDING", 0, now_iso()),
+        "INSERT INTO request_queue(konami_id, keyword, state, attempts, added_at) VALUES(?,?,?,?,?)",
+        (konami_id, keyword, "PENDING", 0, now_iso()),
     )
     con.commit()
 
@@ -403,8 +421,8 @@ def enqueue_need_fetch_cards(con: sqlite3.Connection, limit: int) -> int:
 
     added_at = now_iso()
     con.executemany(
-        "INSERT INTO request_queue(konami_id, state, attempts, added_at) VALUES(?,?,?,?)",
-        [(int(row["konami_id"]), "PENDING", 0, added_at) for row in candidates],
+        "INSERT INTO request_queue(konami_id, keyword, state, attempts, added_at) VALUES(?,?,?,?,?)",
+        [(int(row["konami_id"]), None, "PENDING", 0, added_at) for row in candidates],
     )
     con.commit()
     return len(candidates)
@@ -430,19 +448,29 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
             break
 
         qid = int(row["id"])
-        konami_id = int(row["konami_id"])
+        konami_id = try_int(row["konami_id"])
+        keyword = row["keyword"]
 
         try:
-            res = api.cardinfo_by_konami_id(konami_id)
+            if konami_id is not None:
+                res = api.cardinfo_by_konami_id(konami_id)
+                source = "queue"
+            elif isinstance(keyword, str) and keyword.strip():
+                res = api.cardinfo_by_keyword(keyword.strip())
+                source = "keyword"
+            else:
+                raise RuntimeError("queue item missing konami_id and keyword")
+
             # 取得できない（data空）場合も運用上は「DONE」扱いにするか悩むところ。
             # 初期は「DONE」にして、必要なら別途再投入する運用が安定。
-            staging_write_cards(res.data, source="queue")
+            staging_write_cards(res.data, source=source)
             queue_mark_done(con, qid)
             done += 1
         except Exception as e:
-            LOGGER.error("queue item failed (qid=%s, konami_id=%s): %s", qid, konami_id, e)
+            LOGGER.error("queue item failed (qid=%s, konami_id=%s, keyword=%s): %s", qid, konami_id, keyword, e)
             queue_mark_retry(con, qid, str(e))
-            mark_need_fetch_by_konami_id(con, konami_id)
+            if konami_id is not None:
+                mark_need_fetch_by_konami_id(con, konami_id)
 
     return done
 
@@ -539,6 +567,73 @@ def upsert_card_rows(con: sqlite3.Connection, card: Dict[str, Any], dbver_hash: 
             now_iso(),
         ),
     )
+
+    image_url: Optional[str] = None
+    card_images = card.get("card_images")
+    if isinstance(card_images, list) and card_images and isinstance(card_images[0], dict):
+        v = card_images[0].get("image_url")
+        if isinstance(v, str) and v:
+            image_url = v
+
+    con.execute(
+        """
+        INSERT INTO card_images(card_id, image_url, image_path, fetch_status, last_error, updated_at)
+        VALUES(?, ?, NULL, CASE WHEN ? IS NULL THEN 'ERROR' ELSE 'NEED_FETCH' END, NULL, ?)
+        ON CONFLICT(card_id) DO UPDATE SET
+          image_url=excluded.image_url,
+          updated_at=excluded.updated_at,
+          fetch_status=CASE
+            WHEN excluded.image_url IS NULL THEN 'ERROR'
+            WHEN card_images.image_path IS NULL OR card_images.image_path='' THEN 'NEED_FETCH'
+            ELSE card_images.fetch_status
+          END
+        """,
+        (card_id, image_url, image_url, now_iso()),
+    )
+
+
+def step_download_images(con: sqlite3.Connection, api: ApiClient, limit: int = IMAGE_DOWNLOAD_LIMIT_PER_RUN) -> int:
+    rows = con.execute(
+        """
+        SELECT card_id, image_url
+        FROM card_images
+        WHERE fetch_status IN ('NEED_FETCH', 'ERROR')
+          AND image_url IS NOT NULL
+          AND image_url <> ''
+        ORDER BY card_id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    done = 0
+    temp_dir = IMAGE_DIR.parent / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    for row in rows:
+        card_id = int(row["card_id"])
+        image_url = str(row["image_url"])
+        final_path = IMAGE_DIR / f"{card_id}.jpg"
+        temp_path = temp_dir / f"{card_id}.tmp"
+        try:
+            response = api.session.get(image_url, timeout=HTTP_TIMEOUT_SEC)
+            response.raise_for_status()
+            temp_path.write_bytes(response.content)
+            temp_path.replace(final_path)
+            con.execute(
+                "UPDATE card_images SET image_path=?, fetch_status='OK', last_error=NULL, updated_at=? WHERE card_id=?",
+                (str(final_path), now_iso(), card_id),
+            )
+            con.commit()
+            done += 1
+        except Exception as e:
+            temp_path.unlink(missing_ok=True)
+            con.execute(
+                "UPDATE card_images SET fetch_status='ERROR', last_error=?, updated_at=? WHERE card_id=?",
+                (str(e)[:255], now_iso(), card_id),
+            )
+            con.commit()
+    return done
 
 
 def ingest_one_file(con: sqlite3.Connection, path: Path, dbver_hash: str) -> Tuple[int, Optional[str]]:
@@ -654,7 +749,9 @@ def run_once() -> int:
         kv_set(con, "last_run_at", now_iso())
         con.commit()
 
-        print(f"[OK] run: queue_done={q_done}, ingested_cards={ingested}, api_calls={api.api_calls}")
+        images_done = step_download_images(con, api)
+
+        print(f"[OK] run: queue_done={q_done}, ingested_cards={ingested}, images_done={images_done}, api_calls={api.api_calls}")
         return 0
 
     except Exception as e:
@@ -684,12 +781,15 @@ def cmd_initdb() -> int:
         con.close()
 
 
-def cmd_queue_add(konami_id: int) -> int:
+def cmd_queue_add(konami_id: Optional[int], keyword: Optional[str]) -> int:
     con = db_connect()
     try:
         ensure_schema(con)
-        queue_add(con, konami_id)
-        print(f"[OK] queued konami_id={konami_id}")
+        queue_add(con, konami_id=konami_id, keyword=keyword)
+        if konami_id is not None:
+            print(f"[OK] queued konami_id={konami_id}")
+        else:
+            print(f"[OK] queued keyword={keyword}")
         return 0
     finally:
         con.close()
@@ -701,8 +801,19 @@ def main(argv: List[str]) -> int:
 
     sub.add_parser("initdb", help="SQLite初期化（テーブル作成）")
 
-    p_add = sub.add_parser("queue-add", help="KONAMI_IDをキューに追加")
-    p_add.add_argument("--konami-id", type=int, required=True)
+    p_add = sub.add_parser(
+        "queue-add",
+        help="KONAMI_ID または キーワードをキューに追加",
+        epilog=(
+            "例:\n"
+            "  python main.py queue-add --konami-id 12345678\n"
+            "  python main.py queue-add --keyword Blue-Eyes"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    group = p_add.add_mutually_exclusive_group(required=True)
+    group.add_argument("--konami-id", type=int, help="KONAMI_IDでカード詳細取得を予約")
+    group.add_argument("--keyword", type=str, help="キーワードでカード詳細取得を予約")
 
     sub.add_parser("run", help="1回実行（タスクスケジューラで定期起動する想定）")
 
@@ -711,7 +822,7 @@ def main(argv: List[str]) -> int:
     if args.cmd == "initdb":
         return cmd_initdb()
     if args.cmd == "queue-add":
-        return cmd_queue_add(int(args.konami_id))
+        return cmd_queue_add(args.konami_id, args.keyword)
     if args.cmd == "run":
         return run_once()
 

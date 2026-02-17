@@ -22,8 +22,11 @@ pip install -r requirements-dev.txt
 ```bash
 python main.py initdb
 python main.py queue-add --konami-id 12345678
+python main.py queue-add --keyword "Blue-Eyes"
 python main.py run
 ```
+
+`queue-add` は `--konami-id` と `--keyword` の排他必須指定です（どちらか1つのみ指定）。
 
 ## 開発・品質チェック
 
@@ -34,6 +37,8 @@ ruff check .
 
 ## ディレクトリ（実行後に生成）
 
-- `data/state/` : SQLite DB、ロックファイル
+- `data/db/ygo.sqlite3` : SQLite DB（単一ファイル）
+- `data/state/` : ロックファイル
 - `data/staging/` : API 取得直後の JSONL
 - `data/logs/` : ERRORログ（ローテーション有効）
+- `data/image/card/` : 画像保存先（`{card_id}.jpg`）
