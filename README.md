@@ -1,39 +1,46 @@
 # ygo-daemon
 
-YGOPRODeck API v7 からカード情報を定期同期し、SQLite に保存するバッチ型デーモンです。  
-本READMEは、運用担当・後任開発者が **「何が実装済みで、どこが未実装か」** を素早く把握できるように整理しています。
+YGOPRODeck API v7 からカード情報を段階的に取得し、SQLite に保存するバッチ型デーモンです。  
+この README は、**運用担当・後任開発者向けの引き継ぎ資料**として、実装済み範囲と今後の課題を短時間で把握できる構成に整理しています。
 
 ---
 
-## 1. プロジェクトの目的
+## 1. このプロジェクトで守る前提
 
-- `cardinfo.php` を常に `misc=yes` 付きで取得する
-- APIレスポンスを `cards_raw.json` に **ロスレス保存** する
-- キュー（`request_queue`）を優先消化する
-- 1回の実行で少しずつ進める（Task Scheduler / cron 前提）
+### 1.1 データ保存ポリシー（最重要）
 
-> 補足: APIレスポンスの「原本保持」が最優先です。解析用の `cards_index` は副次テーブルとして扱います。
+- `cardinfo.php` は常に `misc=yes` を付与して取得する
+- API レスポンスは `cards_raw.json` に **ロスレス保存**（原文保持）
+- 検索用の `cards_index` は副次テーブル（原本の代替ではない）
+
+> 実装上は、比較用ハッシュを計算する際のみ `sort_keys=True` で安定化しています。保存する JSON は API で受けたカードオブジェクトをそのまま `json.dumps(..., ensure_ascii=False)` で保持します。
+
+### 1.2 実行モデル
+
+- 1回の `run` は「少し進める」だけ（定期起動前提）
+- queue（`request_queue`）を最優先
+- ingest 失敗時は JSONL を `data/failed/` に退避し、取得済みデータを失わない
 
 ---
 
-## 2. 実行フロー（`python main.py run`）
+## 2. 現在の実行フロー（`python main.py run`）
 
 1. ロック取得（多重実行防止）
-2. DB接続・マイグレーション
-3. `checkDBVer` で更新検知
-4. `dbver` 変化時は `cards_raw.fetch_status=NEED_FETCH` へ更新
+2. DB 接続・マイグレーション
+3. `checkDBVer` 実行
+4. `dbver` 変化時は `cards_raw.fetch_status=NEED_FETCH` を付与（段階再取得の準備）
 5. `ERROR` キューを `PENDING` に戻す
-6. キューが空なら `NEED_FETCH` カードを再投入
-7. キューを消化して staging JSONL を生成
-8. staging JSONL を SQLite へ取り込み
+6. queue が空ならランダム KONAMI_ID で補充
+7. queue を消化して staging JSONL を出力
+8. staging JSONL を SQLite に取り込み（失敗時は `data/failed/` へ移動）
 9. カード画像を取得
 10. ロック解放
 
-### 2.1 重要な設計意図
+### 2.1 設計意図（引き継ぎ向け）
 
-- `dbver` 変化時も即時全件再取得しません。`NEED_FETCH` への印付けのみ行い、定期実行で段階回収します。
-- 1回実行での処理量を上限化し、失敗時影響を局所化します。
-- queue優先を維持しつつ、queueが空のときだけ再同期対象を補充します。
+- `dbver` 変化時に即時全件 API 取得しないのは、1実行あたりの負荷と失敗範囲を限定するため
+- queue を先に処理することで、運用者の投入要求（手動追加）を最短で反映
+- ingest は「ファイル単位」で管理し、失敗時の追跡と再処理をしやすくしている
 
 ---
 
@@ -47,7 +54,7 @@ pip install -r requirements-dev.txt
 
 ---
 
-## 4. CLIコマンド
+## 4. CLI 早見表
 
 ```bash
 python main.py initdb
@@ -56,49 +63,49 @@ python main.py queue-add --keyword "Blue-Eyes"
 python main.py run
 ```
 
-- `queue-add` は `--konami-id` と `--keyword` の排他指定（どちらか1つのみ）
-- `run` は1回実行。スケジューラで繰り返し呼び出す前提
+- `queue-add` は `--konami-id` と `--keyword` の排他指定
+- `run` は 1 回のみ実行（cron / Task Scheduler で繰り返し呼び出す）
 
 ---
 
-## 5. ディレクトリ構成
+## 5. ディレクトリ構成（引き継ぎ用）
 
-### 5.1 アプリケーション
+### 5.1 コード
 
-- `main.py` : エントリポイント。CLI・API呼び出し・取り込み処理の統合
-- `app/orchestrator.py` : 1サイクル実行順序の制御
-- `app/infra/migrate.py` : SQLマイグレーション適用
-- `app/db/migrations/` : DBスキーマ定義
-- `app/keyword_fetch.py` : キーワード検索関連の補助ロジック
+- `main.py` : エントリポイント、API 呼び出し、queue 消化、ingest の主処理
+- `app/orchestrator.py` : 1サイクルの実行順序を統制
+- `app/infra/migrate.py` : SQL マイグレーション適用
+- `app/db/migrations/` : スキーマ定義
+- `app/keyword_fetch.py` : キーワード取得補助
 
 ### 5.2 設定・ドキュメント
 
-- `config/app.conf` : API・リトライ・上限値など運用パラメータ
-- `config/Help/` : CLIヘルプ本文
-- `docs/` : 技術仕様・議事録
-- `tests/` : ユニットテスト
+- `config/app.conf` : API URL / リトライ / 実行上限など
+- `config/Help/` : CLI ヘルプ文言
+- `docs/` : 技術仕様・minutes
+- `tests/` : テスト
 
 ### 5.3 実行時データ
 
-- `data/db/ygo.sqlite3` : SQLite本体
-- `data/lock/daemon.lock` : 排他ロック
-- `data/staging/*.jsonl` : API取得直後の中間データ
-- `data/failed/` : 取り込み失敗ファイル
-- `data/logs/daemon.log` : アプリケーションログ
-- `data/image/card/` : カード画像
+- `data/db/ygo.sqlite3` : SQLite 本体
+- `data/lock/daemon.lock` : ロックファイル
+- `data/staging/*.jsonl` : API 取得直後のステージング
+- `data/failed/` : ingest 失敗ファイル
+- `data/logs/daemon.log` : 実行ログ
+- `data/image/card/` : 保存済みカード画像
 
 ---
 
-## 6. 運用時チェックポイント
+## 6. 日次運用チェック
 
 - `data/lock/daemon.lock` が残留していないか
-- `request_queue` に `ERROR` が滞留していないか
+- `request_queue` の `ERROR` 件数が増えていないか
 - `ingest_files` の `FAILED` 件数が増えていないか
-- `data/failed/` に退避ファイルが積み上がっていないか
+- `data/failed/` の退避ファイルが滞留していないか
 
 ---
 
-## 7. 開発時の確認コマンド
+## 7. 開発時チェック
 
 ```bash
 pytest
@@ -109,9 +116,11 @@ ruff check .
 
 ## 8. 既知課題（要対応）
 
-- 仕様書にある `offset/num` ベース全件同期が実行フローへ未接続
-- ロックが単純ファイル方式で stale lock 対策が弱い
-- ingest失敗時の再取り込み運用（再実行手順）の明文化不足
+1. **offset/num ベースの全件同期が実行フローへ未接続**
+   - 仕様書にある `meta.next_page_offset` を使ったページ進行が未配線
+2. **ロックが単純ファイル方式で stale 判定がない**
+   - 異常終了時に手動復旧が必要
+3. **ingest 失敗からの復旧手順が文書化不足**
+   - `data/failed/` からの再投入フローが未整備
 
-詳細は最新の minutes を参照してください。  
-`docs/minutes/2026-02-18_02_コメント充実とREADME整理.md`
+詳細は `docs/minutes/` の最新記録を参照してください。

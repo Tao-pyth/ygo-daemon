@@ -525,6 +525,7 @@ def staging_write_cards(cards: List[Dict[str, Any]], source: str) -> Optional[Pa
 
 
 def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str) -> int:
+    """PENDING キューを上限件数まで処理し、取得結果を staging JSONL へ保存する。"""
     done = 0
     for _ in range(MAX_QUEUE_ITEMS_PER_RUN):
         row = queue_pick_next(con)
@@ -575,6 +576,8 @@ def ingest_register_pending(con: sqlite3.Connection, path: Path) -> None:
 
 
 def ingest_scan_and_register(con: sqlite3.Connection) -> None:
+    # staging 上に存在する jsonl を ingest 管理テーブルへ取り込み登録する。
+    # 既存 path は ON CONFLICT DO NOTHING により重複登録しない。
     for p in sorted(STAGING_DIR.glob("*.jsonl")):
         ingest_register_pending(con, p)
     con.commit()
@@ -777,7 +780,9 @@ def ingest_finalize(con: sqlite3.Connection, path: Path, status: str, err: Optio
 
 
 def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
-    # stagingをスキャンして ingest_filesへ登録
+    # staging をスキャンして ingest_files へ登録。
+    # 成功時はファイル削除、失敗時は failed/ へ退避して痕跡を残す。
+    # 「取得済みデータを失わない」ため、失敗時もその場で破棄しないことが重要。
     ingest_scan_and_register(con)
     pendings = ingest_get_pending_files(con)
     total = 0

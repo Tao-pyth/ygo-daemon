@@ -32,10 +32,18 @@ def execute_run_cycle(
     step_download_images: Callable[[sqlite3.Connection, object], int],
     now_iso: Callable[[], str],
 ) -> RunResult:
-    """デーモン1サイクル分の処理を、依存注入された関数で順次実行する。"""
+    """デーモン1サイクル分の処理を、依存注入された関数で順次実行する。
+
+    ここは「実行順序の契約」を表す層であり、個別の取得・保存ロジックは
+    `main.py` 側の step 関数へ委譲する。
+    引き継ぎ時は、本関数の順序が運用ポリシー（queue優先・段階再取得）に
+    直結している点を最優先で確認すること。
+    """
     dbver_hash = step_check_dbver(con, api)
 
     if kv_get(con, "dbver_changed", "0") == "1":
+        # dbver変化を検知した周回では、既存カードへ NEED_FETCH を付けるだけに留める。
+        # これにより、1回実行でのAPI負荷を抑えつつ、後続の queue 消化で段階回収できる。
         con.execute("UPDATE cards_raw SET fetch_status='NEED_FETCH' WHERE konami_id IS NOT NULL")
         kv_set(con, "dbver_changed", "0")
         con.commit()
@@ -45,6 +53,7 @@ def execute_run_cycle(
     random_enqueued = 0
     blacklisted = 0
     if not queue_has_pending(con):
+        # queue が空のときだけ補充を許可することで、手動投入タスクの優先度を守る。
         random_enqueued, blacklisted = step_fill_random_queue(con, api)
 
     queue_done = step_consume_queue(con, api, dbver_hash)
