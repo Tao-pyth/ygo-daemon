@@ -7,6 +7,8 @@ from typing import Callable
 
 @dataclass(frozen=True)
 class RunResult:
+    """1回実行の主要成果を呼び出し元へ返すDTO。"""
+
     queue_done: int
     ingested_cards: int
     images_done: int
@@ -29,10 +31,22 @@ def execute_run_cycle(
     now_iso: Callable[[], str],
     max_need_fetch_enqueue_per_run: int,
 ) -> RunResult:
-    """Run one daemon cycle with injected dependencies."""
+    """デーモン1サイクル分の処理を、依存注入された関数で順次実行する。
+
+    実行順序の意図:
+    1. `checkDBVer` で差分更新の有無を判定
+    2. 必要時のみ既存カードを `NEED_FETCH` に戻し、次回以降で段階回収
+    3. queue(ERROR再投入を含む)を先に処理
+    4. queueが空のときだけ `NEED_FETCH` を再投入
+    5. staging JSONL を SQLite に取り込み
+    6. 最後に画像取得を進める
+
+    これにより「1回で全部やり切る」よりも、定期実行前提の安定運用を優先する。
+    """
     dbver_hash = step_check_dbver(con, api)
 
     if kv_get(con, "dbver_changed", "0") == "1":
+        # dbver変更時は一括再取得せず、fetch_statusの更新だけ行って次回runへ処理を分散する。
         con.execute("UPDATE cards_raw SET fetch_status='NEED_FETCH' WHERE konami_id IS NOT NULL")
         kv_set(con, "dbver_changed", "0")
         con.commit()
@@ -40,6 +54,7 @@ def execute_run_cycle(
     queue_requeue_errors(con)
 
     if not queue_has_pending(con):
+        # queue優先ポリシー: PENDINGが空のときだけNEED_FETCHをキューへ補充する。
         enqueue_need_fetch_cards(con, max_need_fetch_enqueue_per_run)
 
     queue_done = step_consume_queue(con, api, dbver_hash)
