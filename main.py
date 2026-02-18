@@ -653,37 +653,54 @@ def upsert_card_rows(con: sqlite3.Connection, card: Dict[str, Any], dbver_hash: 
     )
 
     image_url: Optional[str] = None
+    image_url_cropped: Optional[str] = None
     card_images = card.get("card_images")
     if isinstance(card_images, list) and card_images and isinstance(card_images[0], dict):
         v = card_images[0].get("image_url")
         if isinstance(v, str) and v:
             image_url = v
+        v_cropped = card_images[0].get("image_url_cropped")
+        if isinstance(v_cropped, str) and v_cropped:
+            image_url_cropped = v_cropped
 
     con.execute(
         """
-        INSERT INTO card_images(card_id, image_url, image_path, fetch_status, last_error, updated_at)
-        VALUES(?, ?, NULL, CASE WHEN ? IS NULL THEN 'ERROR' ELSE 'NEED_FETCH' END, NULL, ?)
+        INSERT INTO card_images(
+          card_id,
+          image_url,
+          image_url_cropped,
+          image_path,
+          image_path_cropped,
+          fetch_status,
+          last_error,
+          updated_at
+        )
+        VALUES(?, ?, ?, NULL, NULL, CASE WHEN ? IS NULL OR ? IS NULL THEN 'ERROR' ELSE 'NEED_FETCH' END, NULL, ?)
         ON CONFLICT(card_id) DO UPDATE SET
           image_url=excluded.image_url,
+          image_url_cropped=excluded.image_url_cropped,
           updated_at=excluded.updated_at,
           fetch_status=CASE
-            WHEN excluded.image_url IS NULL THEN 'ERROR'
+            WHEN excluded.image_url IS NULL OR excluded.image_url_cropped IS NULL THEN 'ERROR'
             WHEN card_images.image_path IS NULL OR card_images.image_path='' THEN 'NEED_FETCH'
+            WHEN card_images.image_path_cropped IS NULL OR card_images.image_path_cropped='' THEN 'NEED_FETCH'
             ELSE card_images.fetch_status
           END
         """,
-        (card_id, image_url, image_url, now_iso()),
+        (card_id, image_url, image_url_cropped, image_url, image_url_cropped, now_iso()),
     )
 
 
 def step_download_images(con: sqlite3.Connection, api: ApiClient, limit: int = IMAGE_DOWNLOAD_LIMIT_PER_RUN) -> int:
     rows = con.execute(
         """
-        SELECT card_id, image_url
+        SELECT card_id, image_url, image_url_cropped, image_path, image_path_cropped
         FROM card_images
         WHERE fetch_status IN ('NEED_FETCH', 'ERROR')
           AND image_url IS NOT NULL
           AND image_url <> ''
+          AND image_url_cropped IS NOT NULL
+          AND image_url_cropped <> ''
         ORDER BY card_id ASC
         LIMIT ?
         """,
@@ -696,31 +713,47 @@ def step_download_images(con: sqlite3.Connection, api: ApiClient, limit: int = I
     for row in rows:
         card_id = int(row["card_id"])
         image_url = str(row["image_url"])
+        image_url_cropped = str(row["image_url_cropped"])
         final_path = IMAGE_DIR / f"{card_id}.jpg"
+        final_path_cropped = IMAGE_DIR / f"{card_id}_cropped.jpg"
         temp_path = TEMP_IMAGE_DIR / f"{card_id}.tmp"
-        if final_path.exists() and final_path.stat().st_size > 0:
+        temp_path_cropped = TEMP_IMAGE_DIR / f"{card_id}_cropped.tmp"
+
+        normal_ready = final_path.exists() and final_path.stat().st_size > 0
+        cropped_ready = final_path_cropped.exists() and final_path_cropped.stat().st_size > 0
+
+        if normal_ready and cropped_ready:
             con.execute(
-                "UPDATE card_images SET image_path=?, fetch_status='OK', last_error=NULL, updated_at=? WHERE card_id=?",
-                (str(final_path), now_iso(), card_id),
+                "UPDATE card_images SET image_path=?, image_path_cropped=?, fetch_status='OK', last_error=NULL, updated_at=? WHERE card_id=?",
+                (str(final_path), str(final_path_cropped), now_iso(), card_id),
             )
             con.commit()
-            LOGGER.info("image_skip card_id=%s path=%s", card_id, final_path)
+            LOGGER.info("image_skip card_id=%s path=%s cropped_path=%s", card_id, final_path, final_path_cropped)
             continue
         try:
-            LOGGER.info("image_download_start card_id=%s url=%s", card_id, image_url)
-            response = api.session.get(image_url, timeout=HTTP_TIMEOUT_SEC)
-            response.raise_for_status()
-            temp_path.write_bytes(response.content)
-            temp_path.replace(final_path)
+            LOGGER.info("image_download_start card_id=%s url=%s cropped_url=%s", card_id, image_url, image_url_cropped)
+            if not normal_ready:
+                response = api.session.get(image_url, timeout=HTTP_TIMEOUT_SEC)
+                response.raise_for_status()
+                temp_path.write_bytes(response.content)
+                temp_path.replace(final_path)
+
+            if not cropped_ready:
+                response_cropped = api.session.get(image_url_cropped, timeout=HTTP_TIMEOUT_SEC)
+                response_cropped.raise_for_status()
+                temp_path_cropped.write_bytes(response_cropped.content)
+                temp_path_cropped.replace(final_path_cropped)
+
             con.execute(
-                "UPDATE card_images SET image_path=?, fetch_status='OK', last_error=NULL, updated_at=? WHERE card_id=?",
-                (str(final_path), now_iso(), card_id),
+                "UPDATE card_images SET image_path=?, image_path_cropped=?, fetch_status='OK', last_error=NULL, updated_at=? WHERE card_id=?",
+                (str(final_path), str(final_path_cropped), now_iso(), card_id),
             )
             con.commit()
             done += 1
-            LOGGER.info("image_download_ok card_id=%s path=%s", card_id, final_path)
+            LOGGER.info("image_download_ok card_id=%s path=%s cropped_path=%s", card_id, final_path, final_path_cropped)
         except Exception as e:
             temp_path.unlink(missing_ok=True)
+            temp_path_cropped.unlink(missing_ok=True)
             con.execute(
                 "UPDATE card_images SET fetch_status='ERROR', last_error=?, updated_at=? WHERE card_id=?",
                 (str(e)[:255], now_iso(), card_id),

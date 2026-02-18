@@ -33,6 +33,7 @@ class CardDTO:
     level: int | None
     desc: str | None
     image_url: str | None
+    image_url_cropped: str | None
     raw_json: dict[str, Any]
 
 
@@ -85,6 +86,17 @@ def _extract_image_url(card: dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_image_url_cropped(card: dict[str, Any]) -> str | None:
+    images = card.get("card_images")
+    if isinstance(images, list) and images:
+        first = images[0]
+        if isinstance(first, dict):
+            value = first.get("image_url_cropped")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
 def parse_cards(response_json: dict[str, Any]) -> list[CardDTO]:
     # NOTE(引き継ぎ): parse段階では欠損値を許容し、
     # DB投入の直前まで落とさない方針にしている（原本保存を優先）。
@@ -111,6 +123,7 @@ def parse_cards(response_json: dict[str, Any]) -> list[CardDTO]:
                 level=_to_int(raw_card.get("level")) or _to_int(raw_card.get("linkval")),
                 desc=raw_card.get("desc") if isinstance(raw_card.get("desc"), str) else None,
                 image_url=_extract_image_url(raw_card),
+                image_url_cropped=_extract_image_url_cropped(raw_card),
                 raw_json=raw_card,
             )
         )
@@ -205,17 +218,28 @@ def upsert_card(con: sqlite3.Connection, card: CardDTO) -> None:
 
     con.execute(
         """
-        INSERT INTO card_images(card_id, image_url, image_path, fetch_status, last_error, updated_at)
-        VALUES(?, ?, NULL, 'NEED_FETCH', NULL, datetime('now'))
+        INSERT INTO card_images(
+          card_id,
+          image_url,
+          image_url_cropped,
+          image_path,
+          image_path_cropped,
+          fetch_status,
+          last_error,
+          updated_at
+        )
+        VALUES(?, ?, ?, NULL, NULL, 'NEED_FETCH', NULL, datetime('now'))
         ON CONFLICT(card_id) DO UPDATE SET
           image_url=excluded.image_url,
+          image_url_cropped=excluded.image_url_cropped,
           updated_at=excluded.updated_at,
           fetch_status=CASE
             WHEN card_images.image_path IS NULL OR card_images.image_path='' THEN 'NEED_FETCH'
+            WHEN card_images.image_path_cropped IS NULL OR card_images.image_path_cropped='' THEN 'NEED_FETCH'
             ELSE card_images.fetch_status
           END
         """,
-        (card.card_id, card.image_url),
+        (card.card_id, card.image_url, card.image_url_cropped),
     )
 
 
@@ -225,9 +249,9 @@ def download_card_image(
     session: requests.Session,
     base_dir: Path,
 ) -> bool:
-    if not card.image_url:
+    if not card.image_url or not card.image_url_cropped:
         con.execute(
-            "UPDATE card_images SET fetch_status='ERROR', last_error='image_url missing', updated_at=datetime('now') WHERE card_id=?",
+            "UPDATE card_images SET fetch_status='ERROR', last_error='image_url/image_url_cropped missing', updated_at=datetime('now') WHERE card_id=?",
             (card.card_id,),
         )
         return False
@@ -237,20 +261,29 @@ def download_card_image(
     base_dir.mkdir(parents=True, exist_ok=True)
 
     final_path = base_dir / f"{card.card_id}.jpg"
+    final_path_cropped = base_dir / f"{card.card_id}_cropped.jpg"
     temp_path = temp_dir / f"{card.card_id}.tmp"
+    temp_path_cropped = temp_dir / f"{card.card_id}_cropped.tmp"
 
     try:
         response = session.get(card.image_url, timeout=DEFAULT_TIMEOUT_SEC)
         response.raise_for_status()
         temp_path.write_bytes(response.content)
         temp_path.replace(final_path)
+
+        response_cropped = session.get(card.image_url_cropped, timeout=DEFAULT_TIMEOUT_SEC)
+        response_cropped.raise_for_status()
+        temp_path_cropped.write_bytes(response_cropped.content)
+        temp_path_cropped.replace(final_path_cropped)
+
         con.execute(
-            "UPDATE card_images SET image_path=?, fetch_status='OK', last_error=NULL, updated_at=datetime('now') WHERE card_id=?",
-            (str(final_path), card.card_id),
+            "UPDATE card_images SET image_path=?, image_path_cropped=?, fetch_status='OK', last_error=NULL, updated_at=datetime('now') WHERE card_id=?",
+            (str(final_path), str(final_path_cropped), card.card_id),
         )
         return True
     except Exception as error:
         temp_path.unlink(missing_ok=True)
+        temp_path_cropped.unlink(missing_ok=True)
         con.execute(
             "UPDATE card_images SET fetch_status='ERROR', last_error=?, updated_at=datetime('now') WHERE card_id=?",
             (str(error)[:255], card.card_id),

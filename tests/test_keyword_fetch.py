@@ -37,7 +37,7 @@ class DummySession:
 def test_parse_cards_splits_per_card() -> None:
     payload = {
         "data": [
-            {"id": 1, "name": "Blue-Eyes", "card_images": [{"image_url": "https://img/1.jpg"}]},
+            {"id": 1, "name": "Blue-Eyes", "card_images": [{"image_url": "https://img/1.jpg", "image_url_cropped": "https://img/1c.jpg"}]},
             {"id": 2, "name": "Dark Magician", "misc_info": [{"konami_id": "123"}]},
         ]
     }
@@ -47,6 +47,7 @@ def test_parse_cards_splits_per_card() -> None:
     assert len(cards) == 2
     assert cards[0].card_id == 1
     assert cards[0].image_url == "https://img/1.jpg"
+    assert cards[0].image_url_cropped == "https://img/1c.jpg"
     assert cards[1].konami_id == 123
 
 
@@ -65,7 +66,7 @@ def test_fetch_and_store_by_keyword_upserts_and_downloads(tmp_path: Path) -> Non
                 "attribute": "LIGHT",
                 "level": 8,
                 "desc": "Legendary dragon.",
-                "card_images": [{"image_url": "https://img/100.jpg"}],
+                "card_images": [{"image_url": "https://img/100.jpg", "image_url_cropped": "https://img/100c.jpg"}],
             }
         ]
     }
@@ -73,6 +74,7 @@ def test_fetch_and_store_by_keyword_upserts_and_downloads(tmp_path: Path) -> Non
         [
             DummyResponse(200, payload=payload),
             DummyResponse(200, content=b"fake-image-binary"),
+            DummyResponse(200, content=b"fake-image-cropped-binary"),
         ]
     )
 
@@ -91,10 +93,11 @@ def test_fetch_and_store_by_keyword_upserts_and_downloads(tmp_path: Path) -> Non
     assert raw is not None
     assert raw["source"] == "keyword"
 
-    image = con.execute("SELECT image_path, fetch_status FROM card_images WHERE card_id=100").fetchone()
+    image = con.execute("SELECT image_path, image_path_cropped, fetch_status FROM card_images WHERE card_id=100").fetchone()
     assert image is not None
     assert image["fetch_status"] == "OK"
     assert Path(image["image_path"]).exists()
+    assert Path(image["image_path_cropped"]).exists()
 
     search_call = session.calls[0]
     assert search_call[1]["misc"] == "yes"
