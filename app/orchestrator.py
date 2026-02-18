@@ -13,21 +13,24 @@ class RunResult:
     ingested_cards: int
     images_done: int
     api_calls: int
-    random_enqueued: int
-    blacklisted: int
+    fullsync_ran: bool
+    fullsync_cards: int
+    fullsync_upserted: int
+    fullsync_next_offset: int | None
 
 
 def execute_run_cycle(
     con: sqlite3.Connection,
     *,
+    max_queue_items_per_run: int,
     api: object,
     kv_get: Callable[[sqlite3.Connection, str, str | None], str | None],
     kv_set: Callable[[sqlite3.Connection, str, str], None],
     step_check_dbver: Callable[[sqlite3.Connection, object], str],
     queue_requeue_errors: Callable[[sqlite3.Connection], None],
     queue_has_pending: Callable[[sqlite3.Connection], bool],
-    step_fill_random_queue: Callable[[sqlite3.Connection, object], tuple[int, int]],
     step_consume_queue: Callable[[sqlite3.Connection, object, str], int],
+    step_fullsync_once: Callable[[sqlite3.Connection, object], tuple[bool, int, int, int | None]],
     step_ingest_sqlite: Callable[[sqlite3.Connection, str], int],
     step_download_images: Callable[[sqlite3.Connection, object], int],
     now_iso: Callable[[], str],
@@ -50,13 +53,15 @@ def execute_run_cycle(
 
     queue_requeue_errors(con)
 
-    random_enqueued = 0
-    blacklisted = 0
-    if not queue_has_pending(con):
-        # queue が空のときだけ補充を許可することで、手動投入タスクの優先度を守る。
-        random_enqueued, blacklisted = step_fill_random_queue(con, api)
-
     queue_done = step_consume_queue(con, api, dbver_hash)
+    has_pending_after_queue = queue_has_pending(con)
+    fullsync_ran = False
+    fullsync_cards = 0
+    fullsync_upserted = 0
+    fullsync_next_offset = None
+    if queue_done < max_queue_items_per_run or not has_pending_after_queue:
+        fullsync_ran, fullsync_cards, fullsync_upserted, fullsync_next_offset = step_fullsync_once(con, api)
+
     ingested_cards = step_ingest_sqlite(con, dbver_hash)
 
     kv_set(con, "last_run_at", now_iso())
@@ -69,6 +74,8 @@ def execute_run_cycle(
         ingested_cards=ingested_cards,
         images_done=images_done,
         api_calls=int(getattr(api, "api_calls", 0)),
-        random_enqueued=random_enqueued,
-        blacklisted=blacklisted,
+        fullsync_ran=fullsync_ran,
+        fullsync_cards=fullsync_cards,
+        fullsync_upserted=fullsync_upserted,
+        fullsync_next_offset=fullsync_next_offset,
     )

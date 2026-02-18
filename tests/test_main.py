@@ -117,75 +117,6 @@ def test_cli_queue_add_requires_exclusive_arg() -> None:
     with pytest.raises(SystemExit):
         main.main(["queue-add"])
 
-def test_step_fill_random_queue_adds_only_new_ids(temp_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
-    temp_db.execute(
-        """
-        INSERT INTO cards_raw(card_id, konami_id, json, content_hash, fetched_at, dbver_hash, source, fetch_status)
-        VALUES(1, 1001, '{}', 'h1', datetime('now'), NULL, 'queue', 'OK')
-        """
-    )
-    temp_db.execute(
-        """
-        INSERT INTO request_queue(konami_id, keyword, state, attempts, added_at)
-        VALUES(1002, NULL, 'DONE', 0, datetime('now'))
-        """
-    )
-    temp_db.execute(
-        """
-        INSERT INTO invalid_ids(id, reason, created_at)
-        VALUES(1003, 'HTTP_404', datetime('now'))
-        """
-    )
-    temp_db.commit()
-
-    seq = iter([1001, 1002, 1003, 1004])
-    monkeypatch.setattr(main.random, 'randint', lambda *_: next(seq))
-    monkeypatch.setattr(main, 'RANDOM_FILL_COUNT', 1)
-    monkeypatch.setattr(main, 'MAX_RANDOM_ATTEMPTS', 10)
-
-    class ApiStub:
-        api_calls = 0
-
-        def cardinfo_by_konami_id(self, konami_id: int) -> main.ApiResult:
-            self.api_calls += 1
-            return main.ApiResult(
-                data=[{'id': konami_id, 'name': 'x', 'misc_info': [{'konami_id': konami_id}]}],
-                meta={},
-                raw={},
-            )
-
-    added, blacklisted = main.step_fill_random_queue(temp_db, ApiStub())
-    assert added == 1
-    assert blacklisted == 0
-
-    row = temp_db.execute(
-        "SELECT konami_id, state FROM request_queue WHERE konami_id=1004 ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    assert row is not None
-    assert row['state'] == 'PENDING'
-
-
-def test_step_fill_random_queue_blacklists_empty_response(temp_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(main.random, 'randint', lambda *_: 2222)
-    monkeypatch.setattr(main, 'RANDOM_FILL_COUNT', 1)
-    monkeypatch.setattr(main, 'MAX_RANDOM_ATTEMPTS', 1)
-
-    class ApiStub:
-        api_calls = 0
-
-        def cardinfo_by_konami_id(self, konami_id: int) -> main.ApiResult:
-            self.api_calls += 1
-            return main.ApiResult(data=[], meta={}, raw={})
-
-    added, blacklisted = main.step_fill_random_queue(temp_db, ApiStub())
-
-    assert added == 0
-    assert blacklisted == 1
-    row = temp_db.execute("SELECT id, reason FROM invalid_ids WHERE id=2222").fetchone()
-    assert row is not None
-    assert row['reason'] == 'EMPTY_RESPONSE'
-
-
 def test_step_download_images_skips_existing_file(temp_db: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     image_dir = tmp_path / "data" / "image" / "card"
     temp_dir = tmp_path / "data" / "image" / "temp"
@@ -225,3 +156,58 @@ def test_step_download_images_skips_existing_file(temp_db: sqlite3.Connection, t
     assert row is not None
     assert row["fetch_status"] == "OK"
     assert row["image_path"] == str(existing)
+
+
+def test_is_valid_next_offset() -> None:
+    assert main.is_valid_next_offset(100, 0)
+    assert not main.is_valid_next_offset(None, 0)
+    assert not main.is_valid_next_offset(-1, 0)
+    assert not main.is_valid_next_offset(0, 0)
+
+
+def test_step_fullsync_once_updates_offset(temp_db: sqlite3.Connection) -> None:
+    main.kv_set(temp_db, "fullsync_offset", "0")
+    main.kv_set(temp_db, "fullsync_num", "2")
+    main.kv_set(temp_db, "fullsync_done", "0")
+
+    class ApiStub:
+        def cardinfo_fullsync_page(self, offset: int, num: int) -> main.ApiResult:
+            assert offset == 0
+            assert num == 2
+            return main.ApiResult(
+                data=[{"id": 1, "name": "A"}, {"id": 2, "name": "B"}],
+                meta={"next_page_offset": 2},
+                raw={},
+            )
+
+    ran, cards, upserts, next_offset = main.step_fullsync_once(temp_db, ApiStub())
+
+    assert ran
+    assert cards == 2
+    assert upserts == 2
+    assert next_offset == 2
+    assert main.kv_get(temp_db, "fullsync_offset") == "2"
+    assert main.kv_get(temp_db, "fullsync_done") == "0"
+
+
+def test_step_fullsync_once_marks_done_on_invalid_next_offset(temp_db: sqlite3.Connection) -> None:
+    main.kv_set(temp_db, "fullsync_offset", "5")
+    main.kv_set(temp_db, "fullsync_num", "2")
+    main.kv_set(temp_db, "fullsync_done", "0")
+
+    class ApiStub:
+        def cardinfo_fullsync_page(self, offset: int, num: int) -> main.ApiResult:
+            assert offset == 5
+            return main.ApiResult(
+                data=[{"id": 10, "name": "C"}],
+                meta={"next_page_offset": 5},
+                raw={},
+            )
+
+    ran, cards, upserts, next_offset = main.step_fullsync_once(temp_db, ApiStub())
+
+    assert ran
+    assert cards == 1
+    assert upserts == 1
+    assert next_offset is None
+    assert main.kv_get(temp_db, "fullsync_done") == "1"
