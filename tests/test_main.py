@@ -117,27 +117,73 @@ def test_cli_queue_add_requires_exclusive_arg() -> None:
     with pytest.raises(SystemExit):
         main.main(["queue-add"])
 
-def test_enqueue_need_fetch_cards_queues_only_candidates(temp_db: sqlite3.Connection) -> None:
+def test_step_fill_random_queue_adds_only_new_ids(temp_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
     temp_db.execute(
         """
         INSERT INTO cards_raw(card_id, konami_id, json, content_hash, fetched_at, dbver_hash, source, fetch_status)
-        VALUES(1, 1001, '{}', 'h1', '2026-01-01T00:00:00+00:00', NULL, 'queue', 'NEED_FETCH')
+        VALUES(1, 1001, '{}', 'h1', datetime('now'), NULL, 'queue', 'OK')
         """
     )
     temp_db.execute(
         """
-        INSERT INTO cards_raw(card_id, konami_id, json, content_hash, fetched_at, dbver_hash, source, fetch_status)
-        VALUES(2, 1002, '{}', 'h2', '2026-01-01T00:00:00+00:00', NULL, 'queue', 'OK')
+        INSERT INTO request_queue(konami_id, keyword, state, attempts, added_at)
+        VALUES(1002, NULL, 'DONE', 0, datetime('now'))
+        """
+    )
+    temp_db.execute(
+        """
+        INSERT INTO invalid_ids(id, reason, created_at)
+        VALUES(1003, 'HTTP_404', datetime('now'))
         """
     )
     temp_db.commit()
 
-    inserted = main.enqueue_need_fetch_cards(temp_db, limit=10)
+    seq = iter([1001, 1002, 1003, 1004])
+    monkeypatch.setattr(main.random, 'randint', lambda *_: next(seq))
+    monkeypatch.setattr(main, 'RANDOM_FILL_COUNT', 1)
+    monkeypatch.setattr(main, 'MAX_RANDOM_ATTEMPTS', 10)
 
-    assert inserted == 1
-    row = temp_db.execute("SELECT konami_id, state FROM request_queue ORDER BY id LIMIT 1").fetchone()
-    assert row["konami_id"] == 1001
-    assert row["state"] == "PENDING"
+    class ApiStub:
+        api_calls = 0
+
+        def cardinfo_by_konami_id(self, konami_id: int) -> main.ApiResult:
+            self.api_calls += 1
+            return main.ApiResult(
+                data=[{'id': konami_id, 'name': 'x', 'misc_info': [{'konami_id': konami_id}]}],
+                meta={},
+                raw={},
+            )
+
+    added, blacklisted = main.step_fill_random_queue(temp_db, ApiStub())
+    assert added == 1
+    assert blacklisted == 0
+
+    row = temp_db.execute(
+        "SELECT konami_id, state FROM request_queue WHERE konami_id=1004 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert row['state'] == 'PENDING'
+
+
+def test_step_fill_random_queue_blacklists_empty_response(temp_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main.random, 'randint', lambda *_: 2222)
+    monkeypatch.setattr(main, 'RANDOM_FILL_COUNT', 1)
+    monkeypatch.setattr(main, 'MAX_RANDOM_ATTEMPTS', 1)
+
+    class ApiStub:
+        api_calls = 0
+
+        def cardinfo_by_konami_id(self, konami_id: int) -> main.ApiResult:
+            self.api_calls += 1
+            return main.ApiResult(data=[], meta={}, raw={})
+
+    added, blacklisted = main.step_fill_random_queue(temp_db, ApiStub())
+
+    assert added == 0
+    assert blacklisted == 1
+    row = temp_db.execute("SELECT id, reason FROM invalid_ids WHERE id=2222").fetchone()
+    assert row is not None
+    assert row['reason'] == 'EMPTY_RESPONSE'
 
 
 def test_step_download_images_skips_existing_file(temp_db: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

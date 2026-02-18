@@ -52,8 +52,11 @@ RETRY_BASE_SEC = APP_CONFIG.retry_base_sec
 RETRY_MAX_SEC = APP_CONFIG.retry_max_sec
 
 MAX_QUEUE_ITEMS_PER_RUN = APP_CONFIG.max_queue_items_per_run
-MAX_NEED_FETCH_ENQUEUE_PER_RUN = APP_CONFIG.max_need_fetch_enqueue_per_run
 MAX_API_CALLS_PER_RUN = APP_CONFIG.max_api_calls_per_run   # 100件処理 + dbver確認を想定した上限
+RANDOM_FILL_COUNT = APP_CONFIG.random_fill_count
+MAX_RANDOM_ATTEMPTS = APP_CONFIG.max_random_attempts
+RANDOM_ID_MIN = APP_CONFIG.random_id_min
+RANDOM_ID_MAX = APP_CONFIG.random_id_max
 
 # ディレクトリ
 ROOT = Path(__file__).resolve().parent
@@ -144,6 +147,13 @@ class ApiResult:
     raw: Dict[str, Any]
 
 
+def parse_cards_from_response(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data = raw.get("data")
+    if not isinstance(data, list):
+        return []
+    return [card for card in data if isinstance(card, dict)]
+
+
 class ApiClient:
     def __init__(self) -> None:
         self.session = requests.Session()
@@ -215,7 +225,7 @@ class ApiClient:
         params = {"konami_id": str(konami_id), "misc": API_MISC_VALUE}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
-            data=list(raw.get("data") or []),
+            data=parse_cards_from_response(raw),
             meta=dict(raw.get("meta") or {}),
             raw=raw,
         )
@@ -224,7 +234,7 @@ class ApiClient:
         params = {"fname": keyword, "misc": API_MISC_VALUE}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
-            data=list(raw.get("data") or []),
+            data=parse_cards_from_response(raw),
             meta=dict(raw.get("meta") or {}),
             raw=raw,
         )
@@ -233,7 +243,7 @@ class ApiClient:
         params = {"misc": API_MISC_VALUE, "num": str(num), "offset": str(offset)}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
-            data=list(raw.get("data") or []),
+            data=parse_cards_from_response(raw),
             meta=dict(raw.get("meta") or {}),
             raw=raw,
         )
@@ -420,36 +430,86 @@ def mark_need_fetch_by_konami_id(con: sqlite3.Connection, konami_id: int) -> Non
     con.commit()
 
 
-def enqueue_need_fetch_cards(con: sqlite3.Connection, limit: int) -> int:
-    # NOTE(引き継ぎ): queue優先設計を守るため、PENDING重複投入を避けつつ小分けで再投入する。
-    # limitで1runあたりの投入上限をかけ、Task Scheduler想定の漸進同期に寄せている。
-    candidates = con.execute(
+def invalid_id_exists(con: sqlite3.Connection, konami_id: int) -> bool:
+    row = con.execute("SELECT 1 FROM invalid_ids WHERE id=? LIMIT 1", (konami_id,)).fetchone()
+    return row is not None
+
+
+def register_invalid_id(con: sqlite3.Connection, konami_id: int, reason: str) -> bool:
+    before = con.total_changes
+    con.execute(
         """
-        SELECT DISTINCT cr.konami_id
-        FROM cards_raw cr
-        WHERE cr.konami_id IS NOT NULL
-          AND cr.fetch_status IN ('NEED_FETCH', 'ERROR')
-          AND NOT EXISTS (
-              SELECT 1
-              FROM request_queue q
-              WHERE q.konami_id=cr.konami_id AND q.state='PENDING'
-          )
-        ORDER BY cr.fetched_at ASC
-        LIMIT ?
+        INSERT INTO invalid_ids(id, reason, created_at)
+        VALUES(?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
         """,
-        (limit,),
-    ).fetchall()
-
-    if not candidates:
-        return 0
-
-    added_at = now_iso()
-    con.executemany(
-        "INSERT INTO request_queue(konami_id, keyword, state, attempts, added_at) VALUES(?,?,?,?,?)",
-        [(int(row["konami_id"]), None, "PENDING", 0, added_at) for row in candidates],
+        (konami_id, reason[:255], now_iso()),
     )
     con.commit()
-    return len(candidates)
+    return con.total_changes > before
+
+
+def id_already_used(con: sqlite3.Connection, konami_id: int) -> bool:
+    row = con.execute(
+        """
+        SELECT 1
+        WHERE EXISTS (SELECT 1 FROM cards_raw WHERE konami_id=?)
+           OR EXISTS (SELECT 1 FROM request_queue WHERE konami_id=?)
+           OR EXISTS (SELECT 1 FROM invalid_ids WHERE id=?)
+        """,
+        (konami_id, konami_id, konami_id),
+    ).fetchone()
+    return row is not None
+
+
+def is_not_found_error(error: Exception) -> bool:
+    if not isinstance(error, requests.HTTPError):
+        return False
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) == 404
+
+
+def step_fill_random_queue(con: sqlite3.Connection, api: ApiClient) -> tuple[int, int]:
+    if RANDOM_ID_MIN > RANDOM_ID_MAX:
+        raise ValueError("random id range is invalid")
+
+    added = 0
+    attempts = 0
+    blacklisted = 0
+
+    while added < RANDOM_FILL_COUNT and attempts < MAX_RANDOM_ATTEMPTS:
+        attempts += 1
+        konami_id = random.randint(RANDOM_ID_MIN, RANDOM_ID_MAX)
+
+        if id_already_used(con, konami_id):
+            continue
+
+        try:
+            result = api.cardinfo_by_konami_id(konami_id)
+            if not result.data:
+                if register_invalid_id(con, konami_id, "EMPTY_RESPONSE"):
+                    blacklisted += 1
+                continue
+
+            queue_add(con, konami_id=konami_id, keyword=None)
+            added += 1
+        except Exception as err:
+            if is_not_found_error(err):
+                if register_invalid_id(con, konami_id, "HTTP_404"):
+                    blacklisted += 1
+                continue
+            LOGGER.warning("random_fill_fetch_error id=%s error=%s", konami_id, err)
+
+    if attempts >= MAX_RANDOM_ATTEMPTS and added < RANDOM_FILL_COUNT:
+        LOGGER.warning(
+            "random_fill_attempt_limit reached attempts=%s added=%s target=%s",
+            attempts,
+            added,
+            RANDOM_FILL_COUNT,
+        )
+
+    LOGGER.info("random_fill_summary attempts=%s added=%s blacklisted=%s", attempts, added, blacklisted)
+    return added, blacklisted
 
 
 def staging_write_cards(cards: List[Dict[str, Any]], source: str) -> Optional[Path]:
@@ -778,29 +838,32 @@ def run_once() -> int:
             step_check_dbver=step_check_dbver,
             queue_requeue_errors=queue_requeue_errors,
             queue_has_pending=queue_has_pending,
-            enqueue_need_fetch_cards=enqueue_need_fetch_cards,
+            step_fill_random_queue=step_fill_random_queue,
             step_consume_queue=step_consume_queue,
             step_ingest_sqlite=step_ingest_sqlite,
             step_download_images=step_download_images,
             now_iso=now_iso,
-            max_need_fetch_enqueue_per_run=MAX_NEED_FETCH_ENQUEUE_PER_RUN,
         )
 
         elapsed = time.monotonic() - started
         LOGGER.info(
-            "run_finish elapsed_sec=%.3f queue_done=%s ingested_cards=%s images_done=%s api_calls=%s",
+            "run_finish elapsed_sec=%.3f queue_done=%s ingested_cards=%s images_done=%s api_calls=%s random_enqueued=%s blacklisted=%s",
             elapsed,
             result.queue_done,
             result.ingested_cards,
             result.images_done,
             result.api_calls,
+            result.random_enqueued,
+            result.blacklisted,
         )
         print(
             "[OK] run: "
             f"queue_done={result.queue_done}, "
             f"ingested_cards={result.ingested_cards}, "
             f"images_done={result.images_done}, "
-            f"api_calls={result.api_calls}"
+            f"api_calls={result.api_calls}, "
+            f"random_enqueued={result.random_enqueued}, "
+            f"blacklisted={result.blacklisted}"
         )
         return 0
 
