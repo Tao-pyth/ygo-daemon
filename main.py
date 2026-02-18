@@ -30,6 +30,7 @@ from requests import Response
 from requests.exceptions import RequestException
 
 from app.cli import dispatch
+from app.config import load_app_config
 from app.infra.migrate import apply_migrations
 from app.orchestrator import execute_run_cycle
 
@@ -37,19 +38,22 @@ from app.orchestrator import execute_run_cycle
 # =========================
 # 設定（必要ならここだけ調整）
 # =========================
-API_CARDINFO = "https://db.ygoprodeck.com/api/v7/cardinfo.php"
-API_DBVER = "https://db.ygoprodeck.com/api/v7/checkDBVer.php"
+APP_CONFIG = load_app_config()
 
-RUN_INTERVAL_SLEEP_SEC = 0.6  # API呼び出し間隔（秒）: 0.6秒=約1.6req/s（保守的）
-JITTER_SEC = 0.2              # ランダム揺らぎ（秒）
-HTTP_TIMEOUT_SEC = 30
-RETRY_MAX_ATTEMPTS = 5
-RETRY_BASE_SEC = 0.5
-RETRY_MAX_SEC = 8.0
+API_CARDINFO = APP_CONFIG.api_cardinfo
+API_DBVER = APP_CONFIG.api_dbver
+API_MISC_VALUE = APP_CONFIG.api_misc_value
 
-MAX_QUEUE_ITEMS_PER_RUN = 100
-MAX_NEED_FETCH_ENQUEUE_PER_RUN = 100
-MAX_API_CALLS_PER_RUN = 120   # 100件処理 + dbver確認を想定した上限
+RUN_INTERVAL_SLEEP_SEC = APP_CONFIG.run_interval_sleep_sec  # API呼び出し間隔（秒）: 0.6秒=約1.6req/s（保守的）
+JITTER_SEC = APP_CONFIG.jitter_sec                          # ランダム揺らぎ（秒）
+HTTP_TIMEOUT_SEC = APP_CONFIG.http_timeout_sec
+RETRY_MAX_ATTEMPTS = APP_CONFIG.retry_max_attempts
+RETRY_BASE_SEC = APP_CONFIG.retry_base_sec
+RETRY_MAX_SEC = APP_CONFIG.retry_max_sec
+
+MAX_QUEUE_ITEMS_PER_RUN = APP_CONFIG.max_queue_items_per_run
+MAX_NEED_FETCH_ENQUEUE_PER_RUN = APP_CONFIG.max_need_fetch_enqueue_per_run
+MAX_API_CALLS_PER_RUN = APP_CONFIG.max_api_calls_per_run   # 100件処理 + dbver確認を想定した上限
 
 # ディレクトリ
 ROOT = Path(__file__).resolve().parent
@@ -64,7 +68,7 @@ DB_DIR = DATA_DIR / "db"
 DB_PATH = DB_DIR / "ygo.sqlite3"
 LOCK_PATH = STATE_DIR / "run.lock"
 LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", "INFO").upper()
-IMAGE_DOWNLOAD_LIMIT_PER_RUN = 30
+IMAGE_DOWNLOAD_LIMIT_PER_RUN = APP_CONFIG.image_download_limit_per_run
 
 LOGGER = logging.getLogger("ygo-daemon")
 
@@ -191,7 +195,7 @@ class ApiClient:
         return self._get_json(API_DBVER, {})
 
     def cardinfo_by_konami_id(self, konami_id: int) -> ApiResult:
-        params = {"konami_id": str(konami_id), "misc": "yes"}
+        params = {"konami_id": str(konami_id), "misc": API_MISC_VALUE}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
             data=list(raw.get("data") or []),
@@ -200,7 +204,7 @@ class ApiClient:
         )
 
     def cardinfo_by_keyword(self, keyword: str) -> ApiResult:
-        params = {"fname": keyword, "misc": "yes"}
+        params = {"fname": keyword, "misc": API_MISC_VALUE}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
             data=list(raw.get("data") or []),
@@ -209,7 +213,7 @@ class ApiClient:
         )
 
     def cardinfo_fullsync_page(self, offset: int, num: int) -> ApiResult:
-        params = {"misc": "yes", "num": str(num), "offset": str(offset)}
+        params = {"misc": API_MISC_VALUE, "num": str(num), "offset": str(offset)}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
             data=list(raw.get("data") or []),

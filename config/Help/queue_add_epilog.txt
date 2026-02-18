@@ -1,0 +1,3 @@
+例:
+  python main.py queue-add --konami-id 12345678
+  python main.py queue-add --keyword Blue-Eyes

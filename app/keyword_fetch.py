@@ -12,11 +12,14 @@ import requests
 from requests import Response
 from requests.exceptions import RequestException
 
-API_CARDINFO = "https://db.ygoprodeck.com/api/v7/cardinfo.php"
-DEFAULT_TIMEOUT_SEC = 15
-DEFAULT_MAX_RETRIES = 2
-DEFAULT_DETAIL_PARAMS: dict[str, str] = {"misc": "yes"}
-DEFAULT_SEARCH_PARAM = "fname"
+from app.config import load_app_config
+
+APP_CONFIG = load_app_config()
+API_CARDINFO = APP_CONFIG.api_cardinfo
+DEFAULT_TIMEOUT_SEC = APP_CONFIG.keyword_timeout_sec
+DEFAULT_MAX_RETRIES = APP_CONFIG.keyword_max_retries
+DEFAULT_DETAIL_PARAMS: dict[str, str] = {"misc": APP_CONFIG.api_misc_value}
+DEFAULT_SEARCH_PARAM = APP_CONFIG.keyword_search_param
 
 
 @dataclass(frozen=True)

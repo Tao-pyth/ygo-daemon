@@ -52,6 +52,8 @@ python main.py run
 - `app/infra/migrate.py` : SQLマイグレーション適用
 - `app/db/migrations/` : スキーマ定義
 - `app/keyword_fetch.py` : キーワード取得・保存・画像DLの補助ロジック
+- `config/app.conf` : API URL・タイムアウト・実行上限などの設定集約
+- `config/Help/` : CLIヘルプメッセージ定義
 - `docs/` : 技術仕様・議事メモ
 - `tests/` : 単体テスト
 
