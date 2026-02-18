@@ -11,10 +11,10 @@ YGOPRODeck API v7 定期取得デーモン
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import logging
+import os
 import random
 import sqlite3
 import sys
@@ -29,35 +29,46 @@ import requests
 from requests import Response
 from requests.exceptions import RequestException
 
+from app.cli import dispatch
+from app.config import DB_PATH, load_app_config
 from app.infra.migrate import apply_migrations
+from app.orchestrator import execute_run_cycle
 
 
 # =========================
 # 設定（必要ならここだけ調整）
 # =========================
-API_CARDINFO = "https://db.ygoprodeck.com/api/v7/cardinfo.php"
-API_DBVER = "https://db.ygoprodeck.com/api/v7/checkDBVer.php"
+APP_CONFIG = load_app_config()
 
-RUN_INTERVAL_SLEEP_SEC = 0.6  # API呼び出し間隔（秒）: 0.6秒=約1.6req/s（保守的）
-JITTER_SEC = 0.2              # ランダム揺らぎ（秒）
-HTTP_TIMEOUT_SEC = 30
-RETRY_MAX_ATTEMPTS = 5
-RETRY_BASE_SEC = 0.5
-RETRY_MAX_SEC = 8.0
+API_CARDINFO = APP_CONFIG.api_cardinfo
+API_DBVER = APP_CONFIG.api_dbver
+API_MISC_VALUE = APP_CONFIG.api_misc_value
 
-MAX_QUEUE_ITEMS_PER_RUN = 100
-MAX_NEED_FETCH_ENQUEUE_PER_RUN = 100
-MAX_API_CALLS_PER_RUN = 120   # 100件処理 + dbver確認を想定した上限
+RUN_INTERVAL_SLEEP_SEC = APP_CONFIG.run_interval_sleep_sec  # API呼び出し間隔（秒）: 0.6秒=約1.6req/s（保守的）
+JITTER_SEC = APP_CONFIG.jitter_sec                          # ランダム揺らぎ（秒）
+HTTP_TIMEOUT_SEC = APP_CONFIG.http_timeout_sec
+RETRY_MAX_ATTEMPTS = APP_CONFIG.retry_max_attempts
+RETRY_BASE_SEC = APP_CONFIG.retry_base_sec
+RETRY_MAX_SEC = APP_CONFIG.retry_max_sec
+
+MAX_QUEUE_ITEMS_PER_RUN = APP_CONFIG.max_queue_items_per_run
+MAX_API_CALLS_PER_RUN = APP_CONFIG.max_api_calls_per_run   # 100件処理 + dbver確認を想定した上限
+FULLSYNC_NUM = APP_CONFIG.fullsync_num
 
 # ディレクトリ
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-STATE_DIR = DATA_DIR / "state"
+LOCK_DIR = DATA_DIR / "lock"
 STAGING_DIR = DATA_DIR / "staging"
 LOG_DIR = DATA_DIR / "logs"
+IMAGE_DIR = DATA_DIR / "image" / "card"
+TEMP_IMAGE_DIR = DATA_DIR / "image" / "temp"
+FAILED_INGEST_DIR = DATA_DIR / "failed"
+DB_DIR = DATA_DIR / "db"
 
-DB_PATH = STATE_DIR / "crawl.sqlite3"
-LOCK_PATH = STATE_DIR / "run.lock"
+LOCK_PATH = LOCK_DIR / "daemon.lock"
+LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", APP_CONFIG.log_level).upper()
+IMAGE_DOWNLOAD_LIMIT_PER_RUN = APP_CONFIG.image_download_limit_per_run
 
 LOGGER = logging.getLogger("ygo-daemon")
 
@@ -70,7 +81,7 @@ def now_iso() -> str:
 
 
 def ensure_dirs() -> None:
-    for p in [DATA_DIR, STATE_DIR, STAGING_DIR, LOG_DIR]:
+    for p in [DATA_DIR, DB_DIR, LOCK_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, TEMP_IMAGE_DIR, FAILED_INGEST_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -79,24 +90,26 @@ def configure_logging() -> None:
     if LOGGER.handlers:
         return
 
-    LOGGER.setLevel(logging.INFO)
+    LOGGER.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     handler = RotatingFileHandler(
         LOG_DIR / "daemon.log",
         maxBytes=1_000_000,
         backupCount=5,
         encoding="utf-8",
     )
-    handler.setLevel(logging.ERROR)
+    handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     LOGGER.addHandler(handler)
 
 
 def acquire_lock() -> bool:
     ensure_dirs()
-    if LOCK_PATH.exists():
+    try:
+        with LOCK_PATH.open("x", encoding="utf-8") as lock_file:
+            lock_file.write(now_iso())
+        return True
+    except FileExistsError:
         return False
-    LOCK_PATH.write_text(now_iso(), encoding="utf-8")
-    return True
 
 
 def release_lock() -> None:
@@ -130,6 +143,13 @@ class ApiResult:
     raw: Dict[str, Any]
 
 
+def parse_cards_from_response(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data = raw.get("data")
+    if not isinstance(data, list):
+        return []
+    return [card for card in data if isinstance(card, dict)]
+
+
 class ApiClient:
     def __init__(self) -> None:
         self.session = requests.Session()
@@ -156,12 +176,26 @@ class ApiClient:
         for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
             sleep_rate()
             self.api_calls += 1
+            started_at = time.monotonic()
             try:
                 response = self.session.get(url, params=params, timeout=HTTP_TIMEOUT_SEC)
                 last_response = response
                 response.raise_for_status()
+                elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                LOGGER.info("api_call url=%s status=%s elapsed_ms=%s count=%s", url, response.status_code, elapsed_ms, self.api_calls)
                 return response.json()
             except RequestException as err:
+                elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                status_code = getattr(last_response, "status_code", "N/A")
+                LOGGER.warning(
+                    "api_retry url=%s status=%s elapsed_ms=%s attempt=%s/%s error=%s",
+                    url,
+                    status_code,
+                    elapsed_ms,
+                    attempt,
+                    RETRY_MAX_ATTEMPTS,
+                    err,
+                )
                 last_error = err
                 if not self._should_retry(last_response, err):
                     raise
@@ -184,19 +218,28 @@ class ApiClient:
         return self._get_json(API_DBVER, {})
 
     def cardinfo_by_konami_id(self, konami_id: int) -> ApiResult:
-        params = {"konami_id": str(konami_id), "misc": "yes"}
+        params = {"konami_id": str(konami_id), "misc": API_MISC_VALUE}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
-            data=list(raw.get("data") or []),
+            data=parse_cards_from_response(raw),
+            meta=dict(raw.get("meta") or {}),
+            raw=raw,
+        )
+
+    def cardinfo_by_keyword(self, keyword: str) -> ApiResult:
+        params = {"fname": keyword, "misc": API_MISC_VALUE}
+        raw = self._get_json(API_CARDINFO, params)
+        return ApiResult(
+            data=parse_cards_from_response(raw),
             meta=dict(raw.get("meta") or {}),
             raw=raw,
         )
 
     def cardinfo_fullsync_page(self, offset: int, num: int) -> ApiResult:
-        params = {"misc": "yes", "num": str(num), "offset": str(offset)}
+        params = {"misc": API_MISC_VALUE, "num": str(num), "offset": str(offset)}
         raw = self._get_json(API_CARDINFO, params)
         return ApiResult(
-            data=list(raw.get("data") or []),
+            data=parse_cards_from_response(raw),
             meta=dict(raw.get("meta") or {}),
             raw=raw,
         )
@@ -232,6 +275,31 @@ def kv_set(con: sqlite3.Connection, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value),
     )
+
+
+def kv_get_int(con: sqlite3.Connection, key: str, default: int) -> int:
+    value = kv_get(con, key)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def kv_get_bool(con: sqlite3.Connection, key: str, default: bool) -> bool:
+    value = kv_get(con, key)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def kv_set_int(con: sqlite3.Connection, key: str, value: int) -> None:
+    kv_set(con, key, str(value))
+
+
+def kv_set_bool(con: sqlite3.Connection, key: str, value: bool) -> None:
+    kv_set(con, key, "1" if value else "0")
 
 
 # =========================
@@ -325,6 +393,9 @@ def step_check_dbver(con: sqlite3.Connection, api: ApiClient) -> str:
         # ここで即時に全件API再取得しないのは、1回実行での処理量を制御するため。
         kv_set(con, "dbver_hash", h)
         kv_set(con, "dbver_changed", "1")
+        kv_set_int(con, "fullsync_offset", 0)
+        kv_set_bool(con, "fullsync_done", False)
+        kv_set(con, "fullsync_last_dbver", h)
         con.commit()
 
     return h
@@ -333,10 +404,13 @@ def step_check_dbver(con: sqlite3.Connection, api: ApiClient) -> str:
 # =========================
 # ステップB：キュー（KONAMI_ID）優先消化 → JSONL蓄積
 # =========================
-def queue_add(con: sqlite3.Connection, konami_id: int) -> None:
+def queue_add(con: sqlite3.Connection, *, konami_id: Optional[int], keyword: Optional[str]) -> None:
+    if (konami_id is None) == (keyword is None):
+        raise ValueError("Either konami_id or keyword must be set, but not both")
+
     con.execute(
-        "INSERT INTO request_queue(konami_id, state, attempts, added_at) VALUES(?,?,?,?)",
-        (konami_id, "PENDING", 0, now_iso()),
+        "INSERT INTO request_queue(konami_id, keyword, state, attempts, added_at) VALUES(?,?,?,?,?)",
+        (konami_id, keyword, "PENDING", 0, now_iso()),
     )
     con.commit()
 
@@ -353,6 +427,8 @@ def queue_has_pending(con: sqlite3.Connection) -> bool:
 
 
 def queue_requeue_errors(con: sqlite3.Connection) -> None:
+    # NOTE(引き継ぎ): ERRORを次回以降に再挑戦させる。
+    # ここで握りつぶさず再投入しておくことで、APIの一時障害に強くする。
     con.execute("UPDATE request_queue SET state='PENDING' WHERE state='ERROR'")
     con.commit()
 
@@ -378,38 +454,6 @@ def mark_need_fetch_by_konami_id(con: sqlite3.Connection, konami_id: int) -> Non
     con.commit()
 
 
-def enqueue_need_fetch_cards(con: sqlite3.Connection, limit: int) -> int:
-    # NOTE(引き継ぎ): queue優先設計を守るため、PENDING重複投入を避けつつ小分けで再投入する。
-    # limitで1runあたりの投入上限をかけ、Task Scheduler想定の漸進同期に寄せている。
-    candidates = con.execute(
-        """
-        SELECT DISTINCT cr.konami_id
-        FROM cards_raw cr
-        WHERE cr.konami_id IS NOT NULL
-          AND cr.fetch_status IN ('NEED_FETCH', 'ERROR')
-          AND NOT EXISTS (
-              SELECT 1
-              FROM request_queue q
-              WHERE q.konami_id=cr.konami_id AND q.state='PENDING'
-          )
-        ORDER BY cr.fetched_at ASC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-
-    if not candidates:
-        return 0
-
-    added_at = now_iso()
-    con.executemany(
-        "INSERT INTO request_queue(konami_id, state, attempts, added_at) VALUES(?,?,?,?)",
-        [(int(row["konami_id"]), "PENDING", 0, added_at) for row in candidates],
-    )
-    con.commit()
-    return len(candidates)
-
-
 def staging_write_cards(cards: List[Dict[str, Any]], source: str) -> Optional[Path]:
     if not cards:
         return None
@@ -423,6 +467,7 @@ def staging_write_cards(cards: List[Dict[str, Any]], source: str) -> Optional[Pa
 
 
 def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str) -> int:
+    """PENDING キューを上限件数まで処理し、取得結果を staging JSONL へ保存する。"""
     done = 0
     for _ in range(MAX_QUEUE_ITEMS_PER_RUN):
         row = queue_pick_next(con)
@@ -430,28 +475,93 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
             break
 
         qid = int(row["id"])
-        konami_id = int(row["konami_id"])
+        konami_id = try_int(row["konami_id"])
+        keyword = row["keyword"]
 
         try:
-            res = api.cardinfo_by_konami_id(konami_id)
+            if konami_id is not None:
+                res = api.cardinfo_by_konami_id(konami_id)
+                source = "queue"
+            elif isinstance(keyword, str) and keyword.strip():
+                res = api.cardinfo_by_keyword(keyword.strip())
+                source = "keyword"
+            else:
+                raise RuntimeError("queue item missing konami_id and keyword")
+
             # 取得できない（data空）場合も運用上は「DONE」扱いにするか悩むところ。
             # 初期は「DONE」にして、必要なら別途再投入する運用が安定。
-            staging_write_cards(res.data, source="queue")
+            LOGGER.info("parse_result qid=%s source=%s cards=%s", qid, source, len(res.data))
+            staging_write_cards(res.data, source=source)
             queue_mark_done(con, qid)
             done += 1
         except Exception as e:
-            LOGGER.error("queue item failed (qid=%s, konami_id=%s): %s", qid, konami_id, e)
+            LOGGER.error("queue item failed (qid=%s, konami_id=%s, keyword=%s): %s", qid, konami_id, keyword, e)
             queue_mark_retry(con, qid, str(e))
-            mark_need_fetch_by_konami_id(con, konami_id)
+            if konami_id is not None:
+                mark_need_fetch_by_konami_id(con, konami_id)
 
     return done
 
 
 # =========================
-# ステップC：全件同期（未知取得アルゴリズム）→ JSONL蓄積
+# ステップC：全件同期（offset/num）→ JSONL蓄積
 # =========================
+def get_fullsync_state(con: sqlite3.Connection) -> tuple[int, int, bool]:
+    offset = max(0, kv_get_int(con, "fullsync_offset", 0))
+    num = kv_get_int(con, "fullsync_num", FULLSYNC_NUM)
+    if num <= 0:
+        num = FULLSYNC_NUM
+    done = kv_get_bool(con, "fullsync_done", False)
+    return offset, num, done
+
+
+def set_fullsync_state(con: sqlite3.Connection, *, offset: int | None = None, num: int | None = None, done: bool | None = None) -> None:
+    if offset is not None:
+        kv_set_int(con, "fullsync_offset", max(0, offset))
+    if num is not None and num > 0:
+        kv_set_int(con, "fullsync_num", num)
+    if done is not None:
+        kv_set_bool(con, "fullsync_done", done)
+
+
+def is_valid_next_offset(next_offset: Any, current_offset: int) -> bool:
+    parsed = try_int(next_offset)
+    return parsed is not None and parsed >= 0 and parsed > current_offset
+
+
+def step_fullsync_once(con: sqlite3.Connection, api: ApiClient) -> tuple[bool, int, int, int | None]:
+    current_offset, num, done = get_fullsync_state(con)
+    if done:
+        LOGGER.info("fullsync_skip reason=done")
+        return False, 0, 0, None
+
+    result = api.cardinfo_fullsync_page(current_offset, num)
+    card_count = len(result.data)
+    staging_path = staging_write_cards(result.data, source="fullsync")
+
+    next_offset_raw = result.meta.get("next_page_offset")
+    next_offset = try_int(next_offset_raw)
+    if is_valid_next_offset(next_offset_raw, current_offset):
+        set_fullsync_state(con, offset=int(next_offset), done=False, num=num)
+    else:
+        next_offset = None
+        set_fullsync_state(con, done=True, num=num)
+
+    con.commit()
+    LOGGER.info(
+        "fullsync_page offset=%s num=%s cards=%s upserted=%s next_page_offset=%s staging=%s",
+        current_offset,
+        num,
+        card_count,
+        card_count,
+        next_offset_raw,
+        staging_path,
+    )
+    return True, card_count, card_count, next_offset
+
+
 # =========================
-# ステップC：JSONL → SQLite 一括取り込み
+# ステップD：JSONL → SQLite 一括取り込み
 # =========================
 def ingest_register_pending(con: sqlite3.Connection, path: Path) -> None:
     con.execute(
@@ -462,6 +572,8 @@ def ingest_register_pending(con: sqlite3.Connection, path: Path) -> None:
 
 
 def ingest_scan_and_register(con: sqlite3.Connection) -> None:
+    # staging 上に存在する jsonl を ingest 管理テーブルへ取り込み登録する。
+    # 既存 path は ON CONFLICT DO NOTHING により重複登録しない。
     for p in sorted(STAGING_DIR.glob("*.jsonl")):
         ingest_register_pending(con, p)
     con.commit()
@@ -540,6 +652,116 @@ def upsert_card_rows(con: sqlite3.Connection, card: Dict[str, Any], dbver_hash: 
         ),
     )
 
+    image_url: Optional[str] = None
+    image_url_cropped: Optional[str] = None
+    card_images = card.get("card_images")
+    if isinstance(card_images, list) and card_images and isinstance(card_images[0], dict):
+        v = card_images[0].get("image_url")
+        if isinstance(v, str) and v:
+            image_url = v
+        v_cropped = card_images[0].get("image_url_cropped")
+        if isinstance(v_cropped, str) and v_cropped:
+            image_url_cropped = v_cropped
+
+    con.execute(
+        """
+        INSERT INTO card_images(
+          card_id,
+          image_url,
+          image_url_cropped,
+          image_path,
+          image_path_cropped,
+          fetch_status,
+          last_error,
+          updated_at
+        )
+        VALUES(?, ?, ?, NULL, NULL, CASE WHEN ? IS NULL OR ? IS NULL THEN 'ERROR' ELSE 'NEED_FETCH' END, NULL, ?)
+        ON CONFLICT(card_id) DO UPDATE SET
+          image_url=excluded.image_url,
+          image_url_cropped=excluded.image_url_cropped,
+          updated_at=excluded.updated_at,
+          fetch_status=CASE
+            WHEN excluded.image_url IS NULL OR excluded.image_url_cropped IS NULL THEN 'ERROR'
+            WHEN card_images.image_path IS NULL OR card_images.image_path='' THEN 'NEED_FETCH'
+            WHEN card_images.image_path_cropped IS NULL OR card_images.image_path_cropped='' THEN 'NEED_FETCH'
+            ELSE card_images.fetch_status
+          END
+        """,
+        (card_id, image_url, image_url_cropped, image_url, image_url_cropped, now_iso()),
+    )
+
+
+def step_download_images(con: sqlite3.Connection, api: ApiClient, limit: int = IMAGE_DOWNLOAD_LIMIT_PER_RUN) -> int:
+    rows = con.execute(
+        """
+        SELECT card_id, image_url, image_url_cropped, image_path, image_path_cropped
+        FROM card_images
+        WHERE fetch_status IN ('NEED_FETCH', 'ERROR')
+          AND image_url IS NOT NULL
+          AND image_url <> ''
+          AND image_url_cropped IS NOT NULL
+          AND image_url_cropped <> ''
+        ORDER BY card_id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    done = 0
+    TEMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    for row in rows:
+        card_id = int(row["card_id"])
+        image_url = str(row["image_url"])
+        image_url_cropped = str(row["image_url_cropped"])
+        final_path = IMAGE_DIR / f"{card_id}.jpg"
+        final_path_cropped = IMAGE_DIR / f"{card_id}_cropped.jpg"
+        temp_path = TEMP_IMAGE_DIR / f"{card_id}.tmp"
+        temp_path_cropped = TEMP_IMAGE_DIR / f"{card_id}_cropped.tmp"
+
+        normal_ready = final_path.exists() and final_path.stat().st_size > 0
+        cropped_ready = final_path_cropped.exists() and final_path_cropped.stat().st_size > 0
+
+        if normal_ready and cropped_ready:
+            con.execute(
+                "UPDATE card_images SET image_path=?, image_path_cropped=?, fetch_status='OK', last_error=NULL, updated_at=? WHERE card_id=?",
+                (str(final_path), str(final_path_cropped), now_iso(), card_id),
+            )
+            con.commit()
+            LOGGER.info("image_skip card_id=%s path=%s cropped_path=%s", card_id, final_path, final_path_cropped)
+            continue
+        try:
+            LOGGER.info("image_download_start card_id=%s url=%s cropped_url=%s", card_id, image_url, image_url_cropped)
+            if not normal_ready:
+                response = api.session.get(image_url, timeout=HTTP_TIMEOUT_SEC)
+                response.raise_for_status()
+                temp_path.write_bytes(response.content)
+                temp_path.replace(final_path)
+
+            if not cropped_ready:
+                response_cropped = api.session.get(image_url_cropped, timeout=HTTP_TIMEOUT_SEC)
+                response_cropped.raise_for_status()
+                temp_path_cropped.write_bytes(response_cropped.content)
+                temp_path_cropped.replace(final_path_cropped)
+
+            con.execute(
+                "UPDATE card_images SET image_path=?, image_path_cropped=?, fetch_status='OK', last_error=NULL, updated_at=? WHERE card_id=?",
+                (str(final_path), str(final_path_cropped), now_iso(), card_id),
+            )
+            con.commit()
+            done += 1
+            LOGGER.info("image_download_ok card_id=%s path=%s cropped_path=%s", card_id, final_path, final_path_cropped)
+        except Exception as e:
+            temp_path.unlink(missing_ok=True)
+            temp_path_cropped.unlink(missing_ok=True)
+            con.execute(
+                "UPDATE card_images SET fetch_status='ERROR', last_error=?, updated_at=? WHERE card_id=?",
+                (str(e)[:255], now_iso(), card_id),
+            )
+            con.commit()
+            LOGGER.error("image_download_failed card_id=%s error=%s", card_id, e)
+    return done
+
 
 def ingest_one_file(con: sqlite3.Connection, path: Path, dbver_hash: str) -> Tuple[int, Optional[str]]:
     """
@@ -587,7 +809,9 @@ def ingest_finalize(con: sqlite3.Connection, path: Path, status: str, err: Optio
 
 
 def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
-    # stagingをスキャンして ingest_filesへ登録
+    # staging をスキャンして ingest_files へ登録。
+    # 成功時はファイル削除、失敗時は failed/ へ退避して痕跡を残す。
+    # 「取得済みデータを失わない」ため、失敗時もその場で破棄しないことが重要。
     ingest_scan_and_register(con)
     pendings = ingest_get_pending_files(con)
     total = 0
@@ -604,11 +828,15 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
 
         if err is None:
             ingest_finalize(con, path, status="DONE", err=None)
+            path.unlink(missing_ok=True)
         else:
             LOGGER.error("ingest failed path=%s err=%s", path, err)
             ingest_finalize(con, path, status="FAILED", err=err)
-        path.unlink(missing_ok=True)
+            FAILED_INGEST_DIR.mkdir(parents=True, exist_ok=True)
+            failed_path = FAILED_INGEST_DIR / path.name
+            path.replace(failed_path)
 
+    LOGGER.info("db_upsert_summary upserted_cards=%s pending_files=%s", total, len(pendings))
     return total
 
 
@@ -617,7 +845,15 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
 # =========================
 def run_once() -> int:
     configure_logging()
+    started = time.monotonic()
+    LOGGER.info(
+        "run_start command=run db_path=%s max_queue_items=%s image_limit=%s",
+        DB_PATH,
+        MAX_QUEUE_ITEMS_PER_RUN,
+        IMAGE_DOWNLOAD_LIMIT_PER_RUN,
+    )
     if not acquire_lock():
+        LOGGER.info("run_skip reason=lock_exists lock_path=%s", LOCK_PATH)
         print("[SKIP] 既に実行中の可能性があるため終了します。")
         return 0
 
@@ -628,37 +864,50 @@ def run_once() -> int:
 
         api = ApiClient()
 
-        # A) DB更新検知
-        dbver_hash = step_check_dbver(con, api)
+        result = execute_run_cycle(
+            con,
+            max_queue_items_per_run=MAX_QUEUE_ITEMS_PER_RUN,
+            api=api,
+            kv_get=kv_get,
+            kv_set=kv_set,
+            step_check_dbver=step_check_dbver,
+            queue_requeue_errors=queue_requeue_errors,
+            queue_has_pending=queue_has_pending,
+            step_consume_queue=step_consume_queue,
+            step_fullsync_once=step_fullsync_once,
+            step_ingest_sqlite=step_ingest_sqlite,
+            step_download_images=step_download_images,
+            now_iso=now_iso,
+        )
 
-        if kv_get(con, "dbver_changed", "0") == "1":
-            # NOTE(引き継ぎ): dbver差分検知後はfetch_statusをNEED_FETCHに戻すだけ。
-            # 実際の再取得はキュー経由で少しずつ進める（処理時間のスパイク回避）。
-            con.execute("UPDATE cards_raw SET fetch_status='NEED_FETCH' WHERE konami_id IS NOT NULL")
-            kv_set(con, "dbver_changed", "0")
-            con.commit()
-
-        queue_requeue_errors(con)
-
-        if not queue_has_pending(con):
-            # NOTE(引き継ぎ): 現在の実装は「キューが空ならNEED_FETCHを再投入」まで。
-            # 仕様書にあるoffsetベースのfull sync(1ページ進行)は別途接続が必要。
-            enqueue_need_fetch_cards(con, MAX_NEED_FETCH_ENQUEUE_PER_RUN)
-
-        # B) キュー優先
-        q_done = step_consume_queue(con, api, dbver_hash=dbver_hash)
-
-        # C) SQLite一括取り込み
-        ingested = step_ingest_sqlite(con, dbver_hash=dbver_hash)
-
-        kv_set(con, "last_run_at", now_iso())
-        con.commit()
-
-        print(f"[OK] run: queue_done={q_done}, ingested_cards={ingested}, api_calls={api.api_calls}")
+        elapsed = time.monotonic() - started
+        LOGGER.info(
+            "run_finish elapsed_sec=%.3f queue_done=%s fullsync_ran=%s fullsync_cards=%s fullsync_upserted=%s fullsync_next_offset=%s ingested_cards=%s images_done=%s api_calls=%s",
+            elapsed,
+            result.queue_done,
+            result.fullsync_ran,
+            result.fullsync_cards,
+            result.fullsync_upserted,
+            result.fullsync_next_offset,
+            result.ingested_cards,
+            result.images_done,
+            result.api_calls,
+        )
+        print(
+            "[OK] run: "
+            f"queue_done={result.queue_done}, "
+            f"fullsync_ran={result.fullsync_ran}, "
+            f"fullsync_cards={result.fullsync_cards}, "
+            f"fullsync_upserted={result.fullsync_upserted}, "
+            f"fullsync_next_offset={result.fullsync_next_offset}, "
+            f"ingested_cards={result.ingested_cards}, "
+            f"images_done={result.images_done}, "
+            f"api_calls={result.api_calls}"
+        )
         return 0
 
     except Exception as e:
-        LOGGER.error("run failed: %s", e)
+        LOGGER.error("run failed: %s", e, exc_info=LOG_LEVEL == "DEBUG")
         print(f"[ERROR] {e}")
         return 1
 
@@ -684,38 +933,27 @@ def cmd_initdb() -> int:
         con.close()
 
 
-def cmd_queue_add(konami_id: int) -> int:
+def cmd_queue_add(konami_id: Optional[int], keyword: Optional[str]) -> int:
     con = db_connect()
     try:
         ensure_schema(con)
-        queue_add(con, konami_id)
-        print(f"[OK] queued konami_id={konami_id}")
+        queue_add(con, konami_id=konami_id, keyword=keyword)
+        if konami_id is not None:
+            print(f"[OK] queued konami_id={konami_id}")
+        else:
+            print(f"[OK] queued keyword={keyword}")
         return 0
     finally:
         con.close()
 
 
 def main(argv: List[str]) -> int:
-    parser = argparse.ArgumentParser(description="YGOPRODeck API v7 定期取得デーモン（SQLiteロスレス保存）")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    sub.add_parser("initdb", help="SQLite初期化（テーブル作成）")
-
-    p_add = sub.add_parser("queue-add", help="KONAMI_IDをキューに追加")
-    p_add.add_argument("--konami-id", type=int, required=True)
-
-    sub.add_parser("run", help="1回実行（タスクスケジューラで定期起動する想定）")
-
-    args = parser.parse_args(argv)
-
-    if args.cmd == "initdb":
-        return cmd_initdb()
-    if args.cmd == "queue-add":
-        return cmd_queue_add(int(args.konami_id))
-    if args.cmd == "run":
-        return run_once()
-
-    return 2
+    return dispatch(
+        argv,
+        cmd_initdb=cmd_initdb,
+        cmd_queue_add=cmd_queue_add,
+        cmd_run_once=run_once,
+    )
 
 
 if __name__ == "__main__":
