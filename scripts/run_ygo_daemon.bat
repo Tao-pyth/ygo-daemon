@@ -5,6 +5,6 @@ call .venv\Scripts\activate
 
 if not exist data\logs mkdir data\logs
 
-python main.py run >> data\logs\daemon.log 2>&1
+python main.py run 2>&1
 
 deactivate
