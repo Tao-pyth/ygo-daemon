@@ -29,6 +29,7 @@ class AppConfig:
     keyword_timeout_sec: int
     keyword_max_retries: int
     keyword_search_param: str
+    log_level: str
 
 
 def _read_config(path: Path) -> configparser.ConfigParser:
@@ -56,6 +57,7 @@ def load_app_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         keyword_timeout_sec=parser.getint("keyword_fetch", "default_timeout_sec", fallback=15),
         keyword_max_retries=parser.getint("keyword_fetch", "default_max_retries", fallback=2),
         keyword_search_param=parser.get("keyword_fetch", "default_search_param", fallback="fname"),
+        log_level=parser.get("logging", "log_level", fallback="INFO").upper(),
     )
 
 

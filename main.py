@@ -58,16 +58,17 @@ MAX_API_CALLS_PER_RUN = APP_CONFIG.max_api_calls_per_run   # 100件処理 + dbve
 # ディレクトリ
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-STATE_DIR = DATA_DIR / "state"
+LOCK_DIR = DATA_DIR / "lock"
 STAGING_DIR = DATA_DIR / "staging"
 LOG_DIR = DATA_DIR / "logs"
 IMAGE_DIR = DATA_DIR / "image" / "card"
-FAILED_IMAGE_DIR = DATA_DIR / "image" / "failed"
+TEMP_IMAGE_DIR = DATA_DIR / "image" / "temp"
+FAILED_INGEST_DIR = DATA_DIR / "failed"
 DB_DIR = DATA_DIR / "db"
 
 DB_PATH = DB_DIR / "ygo.sqlite3"
-LOCK_PATH = STATE_DIR / "run.lock"
-LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", "INFO").upper()
+LOCK_PATH = LOCK_DIR / "daemon.lock"
+LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", APP_CONFIG.log_level).upper()
 IMAGE_DOWNLOAD_LIMIT_PER_RUN = APP_CONFIG.image_download_limit_per_run
 
 LOGGER = logging.getLogger("ygo-daemon")
@@ -81,7 +82,7 @@ def now_iso() -> str:
 
 
 def ensure_dirs() -> None:
-    for p in [DATA_DIR, DB_DIR, STATE_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, FAILED_IMAGE_DIR]:
+    for p in [DATA_DIR, DB_DIR, LOCK_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, TEMP_IMAGE_DIR, FAILED_INGEST_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -104,10 +105,12 @@ def configure_logging() -> None:
 
 def acquire_lock() -> bool:
     ensure_dirs()
-    if LOCK_PATH.exists():
+    try:
+        with LOCK_PATH.open("x", encoding="utf-8") as lock_file:
+            lock_file.write(now_iso())
+        return True
+    except FileExistsError:
         return False
-    LOCK_PATH.write_text(now_iso(), encoding="utf-8")
-    return True
 
 
 def release_lock() -> None:
@@ -167,12 +170,26 @@ class ApiClient:
         for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
             sleep_rate()
             self.api_calls += 1
+            started_at = time.monotonic()
             try:
                 response = self.session.get(url, params=params, timeout=HTTP_TIMEOUT_SEC)
                 last_response = response
                 response.raise_for_status()
+                elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                LOGGER.info("api_call url=%s status=%s elapsed_ms=%s count=%s", url, response.status_code, elapsed_ms, self.api_calls)
                 return response.json()
             except RequestException as err:
+                elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                status_code = getattr(last_response, "status_code", "N/A")
+                LOGGER.warning(
+                    "api_retry url=%s status=%s elapsed_ms=%s attempt=%s/%s error=%s",
+                    url,
+                    status_code,
+                    elapsed_ms,
+                    attempt,
+                    RETRY_MAX_ATTEMPTS,
+                    err,
+                )
                 last_error = err
                 if not self._should_retry(last_response, err):
                     raise
@@ -470,6 +487,7 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
 
             # 取得できない（data空）場合も運用上は「DONE」扱いにするか悩むところ。
             # 初期は「DONE」にして、必要なら別途再投入する運用が安定。
+            LOGGER.info("parse_result qid=%s source=%s cards=%s", qid, source, len(res.data))
             staging_write_cards(res.data, source=source)
             queue_mark_done(con, qid)
             done += 1
@@ -614,15 +632,23 @@ def step_download_images(con: sqlite3.Connection, api: ApiClient, limit: int = I
     ).fetchall()
 
     done = 0
-    temp_dir = IMAGE_DIR.parent / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    TEMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
     for row in rows:
         card_id = int(row["card_id"])
         image_url = str(row["image_url"])
         final_path = IMAGE_DIR / f"{card_id}.jpg"
-        temp_path = temp_dir / f"{card_id}.tmp"
+        temp_path = TEMP_IMAGE_DIR / f"{card_id}.tmp"
+        if final_path.exists() and final_path.stat().st_size > 0:
+            con.execute(
+                "UPDATE card_images SET image_path=?, fetch_status='OK', last_error=NULL, updated_at=? WHERE card_id=?",
+                (str(final_path), now_iso(), card_id),
+            )
+            con.commit()
+            LOGGER.info("image_skip card_id=%s path=%s", card_id, final_path)
+            continue
         try:
+            LOGGER.info("image_download_start card_id=%s url=%s", card_id, image_url)
             response = api.session.get(image_url, timeout=HTTP_TIMEOUT_SEC)
             response.raise_for_status()
             temp_path.write_bytes(response.content)
@@ -633,6 +659,7 @@ def step_download_images(con: sqlite3.Connection, api: ApiClient, limit: int = I
             )
             con.commit()
             done += 1
+            LOGGER.info("image_download_ok card_id=%s path=%s", card_id, final_path)
         except Exception as e:
             temp_path.unlink(missing_ok=True)
             con.execute(
@@ -640,6 +667,7 @@ def step_download_images(con: sqlite3.Connection, api: ApiClient, limit: int = I
                 (str(e)[:255], now_iso(), card_id),
             )
             con.commit()
+            LOGGER.error("image_download_failed card_id=%s error=%s", card_id, e)
     return done
 
 
@@ -706,14 +734,15 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
 
         if err is None:
             ingest_finalize(con, path, status="DONE", err=None)
+            path.unlink(missing_ok=True)
         else:
             LOGGER.error("ingest failed path=%s err=%s", path, err)
             ingest_finalize(con, path, status="FAILED", err=err)
+            FAILED_INGEST_DIR.mkdir(parents=True, exist_ok=True)
+            failed_path = FAILED_INGEST_DIR / path.name
+            path.replace(failed_path)
 
-        # NOTE(引き継ぎ): 現行仕様では ingest 成否に関わらず staging を削除する。
-        # 失敗時の再調査性を上げるには failed/ へ退避する実装へ置き換えること。
-        path.unlink(missing_ok=True)
-
+    LOGGER.info("db_upsert_summary upserted_cards=%s pending_files=%s", total, len(pendings))
     return total
 
 
@@ -722,7 +751,15 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
 # =========================
 def run_once() -> int:
     configure_logging()
+    started = time.monotonic()
+    LOGGER.info(
+        "run_start command=run db_path=%s max_queue_items=%s image_limit=%s",
+        DB_PATH,
+        MAX_QUEUE_ITEMS_PER_RUN,
+        IMAGE_DOWNLOAD_LIMIT_PER_RUN,
+    )
     if not acquire_lock():
+        LOGGER.info("run_skip reason=lock_exists lock_path=%s", LOCK_PATH)
         print("[SKIP] 既に実行中の可能性があるため終了します。")
         return 0
 
@@ -749,6 +786,15 @@ def run_once() -> int:
             max_need_fetch_enqueue_per_run=MAX_NEED_FETCH_ENQUEUE_PER_RUN,
         )
 
+        elapsed = time.monotonic() - started
+        LOGGER.info(
+            "run_finish elapsed_sec=%.3f queue_done=%s ingested_cards=%s images_done=%s api_calls=%s",
+            elapsed,
+            result.queue_done,
+            result.ingested_cards,
+            result.images_done,
+            result.api_calls,
+        )
         print(
             "[OK] run: "
             f"queue_done={result.queue_done}, "
@@ -759,7 +805,7 @@ def run_once() -> int:
         return 0
 
     except Exception as e:
-        LOGGER.error("run failed: %s", e)
+        LOGGER.error("run failed: %s", e, exc_info=LOG_LEVEL == "DEBUG")
         print(f"[ERROR] {e}")
         return 1
 
