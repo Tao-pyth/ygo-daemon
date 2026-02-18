@@ -1,35 +1,20 @@
-# =========================
-# Virtual Environment
-# =========================
-.venv/
-venv/
-env/
-
-# =========================
-# Runtime Data
-# =========================
-data/
-
-# Logs
-*.log
-
-# Lock files
-*.lock
-
-# =========================
-# Python Cache
-# =========================
+# ---- python ----
 __pycache__/
 *.pyc
-*.pyo
 
-# =========================
-# Environment Variables
-# =========================
+# ---- venv ----
+.venv/
+
+# ---- runtime data (ygo-daemon) ----
+data/
+
+# logs (念のため)
+*.log
+*.lock
+
+# env
 .env
 
-# =========================
-# OS Files
-# =========================
+# OS
 Thumbs.db
 .DS_Store
