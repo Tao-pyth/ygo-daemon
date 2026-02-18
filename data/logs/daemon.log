@@ -1,0 +1,66 @@
+2026-02-18 22:50:22,791 [INFO] run_start command=run db_path=C:\PG\ygo-daemon\data\db\ygo.sqlite3 max_queue_items=100 image_limit=30
+2026-02-18 22:50:24,086 [INFO] api_call url=https://db.ygoprodeck.com/api/v7/checkDBVer.php status=200 elapsed_ms=509 count=1
+2026-02-18 22:50:24,767 [INFO] api_call url=https://db.ygoprodeck.com/api/v7/cardinfo.php status=200 elapsed_ms=271 count=2
+2026-02-18 22:50:24,777 [INFO] fullsync_page offset=0 num=100 cards=100 upserted=100 next_page_offset=100 staging=C:\PG\ygo-daemon\data\staging\cards_fullsync_20260218_225024.jsonl
+2026-02-18 22:50:24,808 [INFO] db_upsert_summary upserted_cards=100 pending_files=1
+2026-02-18 22:50:24,810 [INFO] image_download_start card_id=295517 url=https://images.ygoprodeck.com/images/cards/295517.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/295517.jpg
+2026-02-18 22:50:25,158 [INFO] image_download_ok card_id=295517 path=C:\PG\ygo-daemon\data\image\card\295517.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\295517_cropped.jpg
+2026-02-18 22:50:25,158 [INFO] image_download_start card_id=1561110 url=https://images.ygoprodeck.com/images/cards/1561110.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/1561110.jpg
+2026-02-18 22:50:25,213 [INFO] image_download_ok card_id=1561110 path=C:\PG\ygo-daemon\data\image\card\1561110.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\1561110_cropped.jpg
+2026-02-18 22:50:25,214 [INFO] image_download_start card_id=1966438 url=https://images.ygoprodeck.com/images/cards/1966438.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/1966438.jpg
+2026-02-18 22:50:25,490 [INFO] image_download_ok card_id=1966438 path=C:\PG\ygo-daemon\data\image\card\1966438.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\1966438_cropped.jpg
+2026-02-18 22:50:25,490 [INFO] image_download_start card_id=2368215 url=https://images.ygoprodeck.com/images/cards/2368215.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/2368215.jpg
+2026-02-18 22:50:25,531 [INFO] image_download_ok card_id=2368215 path=C:\PG\ygo-daemon\data\image\card\2368215.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\2368215_cropped.jpg
+2026-02-18 22:50:25,531 [INFO] image_download_start card_id=3900605 url=https://images.ygoprodeck.com/images/cards/3900605.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/3900605.jpg
+2026-02-18 22:50:25,758 [INFO] image_download_ok card_id=3900605 path=C:\PG\ygo-daemon\data\image\card\3900605.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\3900605_cropped.jpg
+2026-02-18 22:50:25,758 [INFO] image_download_start card_id=4682617 url=https://images.ygoprodeck.com/images/cards/4682617.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/4682617.jpg
+2026-02-18 22:50:26,044 [INFO] image_download_ok card_id=4682617 path=C:\PG\ygo-daemon\data\image\card\4682617.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\4682617_cropped.jpg
+2026-02-18 22:50:26,044 [INFO] image_download_start card_id=4731783 url=https://images.ygoprodeck.com/images/cards/4731783.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/4731783.jpg
+2026-02-18 22:50:26,089 [INFO] image_download_ok card_id=4731783 path=C:\PG\ygo-daemon\data\image\card\4731783.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\4731783_cropped.jpg
+2026-02-18 22:50:26,089 [INFO] image_download_start card_id=5728014 url=https://images.ygoprodeck.com/images/cards/5728014.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/5728014.jpg
+2026-02-18 22:50:27,019 [INFO] image_download_ok card_id=5728014 path=C:\PG\ygo-daemon\data\image\card\5728014.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\5728014_cropped.jpg
+2026-02-18 22:50:27,019 [INFO] image_download_start card_id=6004133 url=https://images.ygoprodeck.com/images/cards/6004133.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/6004133.jpg
+2026-02-18 22:50:27,278 [INFO] image_download_ok card_id=6004133 path=C:\PG\ygo-daemon\data\image\card\6004133.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\6004133_cropped.jpg
+2026-02-18 22:50:27,278 [INFO] image_download_start card_id=6552971 url=https://images.ygoprodeck.com/images/cards/6552971.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/6552971.jpg
+2026-02-18 22:50:27,316 [INFO] image_download_ok card_id=6552971 path=C:\PG\ygo-daemon\data\image\card\6552971.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\6552971_cropped.jpg
+2026-02-18 22:50:27,316 [INFO] image_download_start card_id=6850209 url=https://images.ygoprodeck.com/images/cards/6850209.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/6850209.jpg
+2026-02-18 22:50:27,728 [INFO] image_download_ok card_id=6850209 path=C:\PG\ygo-daemon\data\image\card\6850209.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\6850209_cropped.jpg
+2026-02-18 22:50:27,728 [INFO] image_download_start card_id=7279373 url=https://images.ygoprodeck.com/images/cards/7279373.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/7279373.jpg
+2026-02-18 22:50:27,996 [INFO] image_download_ok card_id=7279373 path=C:\PG\ygo-daemon\data\image\card\7279373.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\7279373_cropped.jpg
+2026-02-18 22:50:27,997 [INFO] image_download_start card_id=8719957 url=https://images.ygoprodeck.com/images/cards/8719957.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/8719957.jpg
+2026-02-18 22:50:28,038 [INFO] image_download_ok card_id=8719957 path=C:\PG\ygo-daemon\data\image\card\8719957.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\8719957_cropped.jpg
+2026-02-18 22:50:28,038 [INFO] image_download_start card_id=8949584 url=https://images.ygoprodeck.com/images/cards/8949584.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/8949584.jpg
+2026-02-18 22:50:28,595 [INFO] image_download_ok card_id=8949584 path=C:\PG\ygo-daemon\data\image\card\8949584.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\8949584_cropped.jpg
+2026-02-18 22:50:28,595 [INFO] image_download_start card_id=10493654 url=https://images.ygoprodeck.com/images/cards/10493654.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/10493654.jpg
+2026-02-18 22:50:28,836 [INFO] image_download_ok card_id=10493654 path=C:\PG\ygo-daemon\data\image\card\10493654.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\10493654_cropped.jpg
+2026-02-18 22:50:28,837 [INFO] image_download_start card_id=11714098 url=https://images.ygoprodeck.com/images/cards/11714098.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/11714098.jpg
+2026-02-18 22:50:28,880 [INFO] image_download_ok card_id=11714098 path=C:\PG\ygo-daemon\data\image\card\11714098.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\11714098_cropped.jpg
+2026-02-18 22:50:28,880 [INFO] image_download_start card_id=12694768 url=https://images.ygoprodeck.com/images/cards/12694768.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/12694768.jpg
+2026-02-18 22:50:29,122 [INFO] image_download_ok card_id=12694768 path=C:\PG\ygo-daemon\data\image\card\12694768.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\12694768_cropped.jpg
+2026-02-18 22:50:29,122 [INFO] image_download_start card_id=13026402 url=https://images.ygoprodeck.com/images/cards/13026402.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/13026402.jpg
+2026-02-18 22:50:29,165 [INFO] image_download_ok card_id=13026402 path=C:\PG\ygo-daemon\data\image\card\13026402.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\13026402_cropped.jpg
+2026-02-18 22:50:29,165 [INFO] image_download_start card_id=13662809 url=https://images.ygoprodeck.com/images/cards/13662809.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/13662809.jpg
+2026-02-18 22:50:29,838 [INFO] image_download_ok card_id=13662809 path=C:\PG\ygo-daemon\data\image\card\13662809.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\13662809_cropped.jpg
+2026-02-18 22:50:29,838 [INFO] image_download_start card_id=14261867 url=https://images.ygoprodeck.com/images/cards/14261867.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/14261867.jpg
+2026-02-18 22:50:30,073 [INFO] image_download_ok card_id=14261867 path=C:\PG\ygo-daemon\data\image\card\14261867.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\14261867_cropped.jpg
+2026-02-18 22:50:30,073 [INFO] image_download_start card_id=15308295 url=https://images.ygoprodeck.com/images/cards/15308295.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/15308295.jpg
+2026-02-18 22:50:30,517 [INFO] image_download_ok card_id=15308295 path=C:\PG\ygo-daemon\data\image\card\15308295.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\15308295_cropped.jpg
+2026-02-18 22:50:30,517 [INFO] image_download_start card_id=18318842 url=https://images.ygoprodeck.com/images/cards/18318842.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/18318842.jpg
+2026-02-18 22:50:30,782 [INFO] image_download_ok card_id=18318842 path=C:\PG\ygo-daemon\data\image\card\18318842.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\18318842_cropped.jpg
+2026-02-18 22:50:30,783 [INFO] image_download_start card_id=19596712 url=https://images.ygoprodeck.com/images/cards/19596712.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/19596712.jpg
+2026-02-18 22:50:31,268 [INFO] image_download_ok card_id=19596712 path=C:\PG\ygo-daemon\data\image\card\19596712.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\19596712_cropped.jpg
+2026-02-18 22:50:31,268 [INFO] image_download_start card_id=21044178 url=https://images.ygoprodeck.com/images/cards/21044178.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/21044178.jpg
+2026-02-18 22:50:31,515 [INFO] image_download_ok card_id=21044178 path=C:\PG\ygo-daemon\data\image\card\21044178.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\21044178_cropped.jpg
+2026-02-18 22:50:31,516 [INFO] image_download_start card_id=21597117 url=https://images.ygoprodeck.com/images/cards/21597117.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/21597117.jpg
+2026-02-18 22:50:31,564 [INFO] image_download_ok card_id=21597117 path=C:\PG\ygo-daemon\data\image\card\21597117.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\21597117_cropped.jpg
+2026-02-18 22:50:31,565 [INFO] image_download_start card_id=21846145 url=https://images.ygoprodeck.com/images/cards/21846145.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/21846145.jpg
+2026-02-18 22:50:31,824 [INFO] image_download_ok card_id=21846145 path=C:\PG\ygo-daemon\data\image\card\21846145.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\21846145_cropped.jpg
+2026-02-18 22:50:31,825 [INFO] image_download_start card_id=22933016 url=https://images.ygoprodeck.com/images/cards/22933016.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/22933016.jpg
+2026-02-18 22:50:32,045 [INFO] image_download_ok card_id=22933016 path=C:\PG\ygo-daemon\data\image\card\22933016.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\22933016_cropped.jpg
+2026-02-18 22:50:32,046 [INFO] image_download_start card_id=23587624 url=https://images.ygoprodeck.com/images/cards/23587624.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/23587624.jpg
+2026-02-18 22:50:32,296 [INFO] image_download_ok card_id=23587624 path=C:\PG\ygo-daemon\data\image\card\23587624.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\23587624_cropped.jpg
+2026-02-18 22:50:32,296 [INFO] image_download_start card_id=23771716 url=https://images.ygoprodeck.com/images/cards/23771716.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/23771716.jpg
+2026-02-18 22:50:32,516 [INFO] image_download_ok card_id=23771716 path=C:\PG\ygo-daemon\data\image\card\23771716.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\23771716_cropped.jpg
+2026-02-18 22:50:32,517 [INFO] image_download_start card_id=23784496 url=https://images.ygoprodeck.com/images/cards/23784496.jpg cropped_url=https://images.ygoprodeck.com/images/cards_cropped/23784496.jpg
+2026-02-18 22:50:32,974 [INFO] image_download_ok card_id=23784496 path=C:\PG\ygo-daemon\data\image\card\23784496.jpg cropped_path=C:\PG\ygo-daemon\data\image\card\23784496_cropped.jpg
+2026-02-18 22:50:32,974 [INFO] run_finish elapsed_sec=10.184 queue_done=0 fullsync_ran=True fullsync_cards=100 fullsync_upserted=100 fullsync_next_offset=100 ingested_cards=100 images_done=30 api_calls=2
