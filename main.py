@@ -30,7 +30,7 @@ from requests import Response
 from requests.exceptions import RequestException
 
 from app.cli import dispatch
-from app.config import load_app_config
+from app.config import DB_PATH, load_app_config
 from app.infra.migrate import apply_migrations
 from app.orchestrator import execute_run_cycle
 
@@ -53,10 +53,7 @@ RETRY_MAX_SEC = APP_CONFIG.retry_max_sec
 
 MAX_QUEUE_ITEMS_PER_RUN = APP_CONFIG.max_queue_items_per_run
 MAX_API_CALLS_PER_RUN = APP_CONFIG.max_api_calls_per_run   # 100件処理 + dbver確認を想定した上限
-RANDOM_FILL_COUNT = APP_CONFIG.random_fill_count
-MAX_RANDOM_ATTEMPTS = APP_CONFIG.max_random_attempts
-RANDOM_ID_MIN = APP_CONFIG.random_id_min
-RANDOM_ID_MAX = APP_CONFIG.random_id_max
+FULLSYNC_NUM = APP_CONFIG.fullsync_num
 
 # ディレクトリ
 ROOT = Path(__file__).resolve().parent
@@ -69,7 +66,6 @@ TEMP_IMAGE_DIR = DATA_DIR / "image" / "temp"
 FAILED_INGEST_DIR = DATA_DIR / "failed"
 DB_DIR = DATA_DIR / "db"
 
-DB_PATH = DB_DIR / "ygo.sqlite3"
 LOCK_PATH = LOCK_DIR / "daemon.lock"
 LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", APP_CONFIG.log_level).upper()
 IMAGE_DOWNLOAD_LIMIT_PER_RUN = APP_CONFIG.image_download_limit_per_run
@@ -281,6 +277,31 @@ def kv_set(con: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def kv_get_int(con: sqlite3.Connection, key: str, default: int) -> int:
+    value = kv_get(con, key)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def kv_get_bool(con: sqlite3.Connection, key: str, default: bool) -> bool:
+    value = kv_get(con, key)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def kv_set_int(con: sqlite3.Connection, key: str, value: int) -> None:
+    kv_set(con, key, str(value))
+
+
+def kv_set_bool(con: sqlite3.Connection, key: str, value: bool) -> None:
+    kv_set(con, key, "1" if value else "0")
+
+
 # =========================
 # JSON抽出（索引用）
 # =========================
@@ -372,6 +393,9 @@ def step_check_dbver(con: sqlite3.Connection, api: ApiClient) -> str:
         # ここで即時に全件API再取得しないのは、1回実行での処理量を制御するため。
         kv_set(con, "dbver_hash", h)
         kv_set(con, "dbver_changed", "1")
+        kv_set_int(con, "fullsync_offset", 0)
+        kv_set_bool(con, "fullsync_done", False)
+        kv_set(con, "fullsync_last_dbver", h)
         con.commit()
 
     return h
@@ -430,88 +454,6 @@ def mark_need_fetch_by_konami_id(con: sqlite3.Connection, konami_id: int) -> Non
     con.commit()
 
 
-def invalid_id_exists(con: sqlite3.Connection, konami_id: int) -> bool:
-    row = con.execute("SELECT 1 FROM invalid_ids WHERE id=? LIMIT 1", (konami_id,)).fetchone()
-    return row is not None
-
-
-def register_invalid_id(con: sqlite3.Connection, konami_id: int, reason: str) -> bool:
-    before = con.total_changes
-    con.execute(
-        """
-        INSERT INTO invalid_ids(id, reason, created_at)
-        VALUES(?, ?, ?)
-        ON CONFLICT(id) DO NOTHING
-        """,
-        (konami_id, reason[:255], now_iso()),
-    )
-    con.commit()
-    return con.total_changes > before
-
-
-def id_already_used(con: sqlite3.Connection, konami_id: int) -> bool:
-    row = con.execute(
-        """
-        SELECT 1
-        WHERE EXISTS (SELECT 1 FROM cards_raw WHERE konami_id=?)
-           OR EXISTS (SELECT 1 FROM request_queue WHERE konami_id=?)
-           OR EXISTS (SELECT 1 FROM invalid_ids WHERE id=?)
-        """,
-        (konami_id, konami_id, konami_id),
-    ).fetchone()
-    return row is not None
-
-
-def is_not_found_error(error: Exception) -> bool:
-    if not isinstance(error, requests.HTTPError):
-        return False
-    response = getattr(error, "response", None)
-    return getattr(response, "status_code", None) == 404
-
-
-def step_fill_random_queue(con: sqlite3.Connection, api: ApiClient) -> tuple[int, int]:
-    if RANDOM_ID_MIN > RANDOM_ID_MAX:
-        raise ValueError("random id range is invalid")
-
-    added = 0
-    attempts = 0
-    blacklisted = 0
-
-    while added < RANDOM_FILL_COUNT and attempts < MAX_RANDOM_ATTEMPTS:
-        attempts += 1
-        konami_id = random.randint(RANDOM_ID_MIN, RANDOM_ID_MAX)
-
-        if id_already_used(con, konami_id):
-            continue
-
-        try:
-            result = api.cardinfo_by_konami_id(konami_id)
-            if not result.data:
-                if register_invalid_id(con, konami_id, "EMPTY_RESPONSE"):
-                    blacklisted += 1
-                continue
-
-            queue_add(con, konami_id=konami_id, keyword=None)
-            added += 1
-        except Exception as err:
-            if is_not_found_error(err):
-                if register_invalid_id(con, konami_id, "HTTP_404"):
-                    blacklisted += 1
-                continue
-            LOGGER.warning("random_fill_fetch_error id=%s error=%s", konami_id, err)
-
-    if attempts >= MAX_RANDOM_ATTEMPTS and added < RANDOM_FILL_COUNT:
-        LOGGER.warning(
-            "random_fill_attempt_limit reached attempts=%s added=%s target=%s",
-            attempts,
-            added,
-            RANDOM_FILL_COUNT,
-        )
-
-    LOGGER.info("random_fill_summary attempts=%s added=%s blacklisted=%s", attempts, added, blacklisted)
-    return added, blacklisted
-
-
 def staging_write_cards(cards: List[Dict[str, Any]], source: str) -> Optional[Path]:
     if not cards:
         return None
@@ -562,10 +504,64 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
 
 
 # =========================
-# ステップC：全件同期（未知取得アルゴリズム）→ JSONL蓄積
+# ステップC：全件同期（offset/num）→ JSONL蓄積
 # =========================
+def get_fullsync_state(con: sqlite3.Connection) -> tuple[int, int, bool]:
+    offset = max(0, kv_get_int(con, "fullsync_offset", 0))
+    num = kv_get_int(con, "fullsync_num", FULLSYNC_NUM)
+    if num <= 0:
+        num = FULLSYNC_NUM
+    done = kv_get_bool(con, "fullsync_done", False)
+    return offset, num, done
+
+
+def set_fullsync_state(con: sqlite3.Connection, *, offset: int | None = None, num: int | None = None, done: bool | None = None) -> None:
+    if offset is not None:
+        kv_set_int(con, "fullsync_offset", max(0, offset))
+    if num is not None and num > 0:
+        kv_set_int(con, "fullsync_num", num)
+    if done is not None:
+        kv_set_bool(con, "fullsync_done", done)
+
+
+def is_valid_next_offset(next_offset: Any, current_offset: int) -> bool:
+    parsed = try_int(next_offset)
+    return parsed is not None and parsed >= 0 and parsed > current_offset
+
+
+def step_fullsync_once(con: sqlite3.Connection, api: ApiClient) -> tuple[bool, int, int, int | None]:
+    current_offset, num, done = get_fullsync_state(con)
+    if done:
+        LOGGER.info("fullsync_skip reason=done")
+        return False, 0, 0, None
+
+    result = api.cardinfo_fullsync_page(current_offset, num)
+    card_count = len(result.data)
+    staging_path = staging_write_cards(result.data, source="fullsync")
+
+    next_offset_raw = result.meta.get("next_page_offset")
+    next_offset = try_int(next_offset_raw)
+    if is_valid_next_offset(next_offset_raw, current_offset):
+        set_fullsync_state(con, offset=int(next_offset), done=False, num=num)
+    else:
+        next_offset = None
+        set_fullsync_state(con, done=True, num=num)
+
+    con.commit()
+    LOGGER.info(
+        "fullsync_page offset=%s num=%s cards=%s upserted=%s next_page_offset=%s staging=%s",
+        current_offset,
+        num,
+        card_count,
+        card_count,
+        next_offset_raw,
+        staging_path,
+    )
+    return True, card_count, card_count, next_offset
+
+
 # =========================
-# ステップC：JSONL → SQLite 一括取り込み
+# ステップD：JSONL → SQLite 一括取り込み
 # =========================
 def ingest_register_pending(con: sqlite3.Connection, path: Path) -> None:
     con.execute(
@@ -837,14 +833,15 @@ def run_once() -> int:
 
         result = execute_run_cycle(
             con,
+            max_queue_items_per_run=MAX_QUEUE_ITEMS_PER_RUN,
             api=api,
             kv_get=kv_get,
             kv_set=kv_set,
             step_check_dbver=step_check_dbver,
             queue_requeue_errors=queue_requeue_errors,
             queue_has_pending=queue_has_pending,
-            step_fill_random_queue=step_fill_random_queue,
             step_consume_queue=step_consume_queue,
+            step_fullsync_once=step_fullsync_once,
             step_ingest_sqlite=step_ingest_sqlite,
             step_download_images=step_download_images,
             now_iso=now_iso,
@@ -852,23 +849,27 @@ def run_once() -> int:
 
         elapsed = time.monotonic() - started
         LOGGER.info(
-            "run_finish elapsed_sec=%.3f queue_done=%s ingested_cards=%s images_done=%s api_calls=%s random_enqueued=%s blacklisted=%s",
+            "run_finish elapsed_sec=%.3f queue_done=%s fullsync_ran=%s fullsync_cards=%s fullsync_upserted=%s fullsync_next_offset=%s ingested_cards=%s images_done=%s api_calls=%s",
             elapsed,
             result.queue_done,
+            result.fullsync_ran,
+            result.fullsync_cards,
+            result.fullsync_upserted,
+            result.fullsync_next_offset,
             result.ingested_cards,
             result.images_done,
             result.api_calls,
-            result.random_enqueued,
-            result.blacklisted,
         )
         print(
             "[OK] run: "
             f"queue_done={result.queue_done}, "
+            f"fullsync_ran={result.fullsync_ran}, "
+            f"fullsync_cards={result.fullsync_cards}, "
+            f"fullsync_upserted={result.fullsync_upserted}, "
+            f"fullsync_next_offset={result.fullsync_next_offset}, "
             f"ingested_cards={result.ingested_cards}, "
             f"images_done={result.images_done}, "
-            f"api_calls={result.api_calls}, "
-            f"random_enqueued={result.random_enqueued}, "
-            f"blacklisted={result.blacklisted}"
+            f"api_calls={result.api_calls}"
         )
         return 0
 

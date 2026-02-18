@@ -30,11 +30,12 @@ YGOPRODeck API v7 からカード情報を段階的に取得し、SQLite に保�
 3. `checkDBVer` 実行
 4. `dbver` 変化時は `cards_raw.fetch_status=NEED_FETCH` を付与（段階再取得の準備）
 5. `ERROR` キューを `PENDING` に戻す
-6. queue が空ならランダム KONAMI_ID で補充
-7. queue を消化して staging JSONL を出力
-8. staging JSONL を SQLite に取り込み（失敗時は `data/failed/` へ移動）
-9. カード画像を取得
-10. ロック解放
+6. queue を消化して staging JSONL を出力
+7. queue が空（または余力あり）なら fullsync を1ページだけ実行（`offset/num`）
+8. `meta.next_page_offset` で次回 offset を更新、無効値なら完了扱い
+9. staging JSONL を SQLite に取り込み（失敗時は `data/failed/` へ移動）
+10. カード画像を取得
+11. ロック解放
 
 ### 2.1 設計意図（引き継ぎ向け）
 
@@ -116,11 +117,9 @@ ruff check .
 
 ## 8. 既知課題（要対応）
 
-1. **offset/num ベースの全件同期が実行フローへ未接続**
-   - 仕様書にある `meta.next_page_offset` を使ったページ進行が未配線
-2. **ロックが単純ファイル方式で stale 判定がない**
+1. **ロックが単純ファイル方式で stale 判定がない**
    - 異常終了時に手動復旧が必要
-3. **ingest 失敗からの復旧手順が文書化不足**
+2. **ingest 失敗からの復旧手順が文書化不足**
    - `data/failed/` からの再投入フローが未整備
 
 詳細は `docs/minutes/` の最新記録を参照してください。
