@@ -11,7 +11,6 @@ YGOPRODeck API v7 定期取得デーモン
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import logging
@@ -30,7 +29,9 @@ import requests
 from requests import Response
 from requests.exceptions import RequestException
 
+from app.cli import dispatch
 from app.infra.migrate import apply_migrations
+from app.orchestrator import execute_run_cycle
 
 
 # =========================
@@ -728,35 +729,29 @@ def run_once() -> int:
 
         api = ApiClient()
 
-        # A) DB更新検知
-        dbver_hash = step_check_dbver(con, api)
+        result = execute_run_cycle(
+            con,
+            api=api,
+            kv_get=kv_get,
+            kv_set=kv_set,
+            step_check_dbver=step_check_dbver,
+            queue_requeue_errors=queue_requeue_errors,
+            queue_has_pending=queue_has_pending,
+            enqueue_need_fetch_cards=enqueue_need_fetch_cards,
+            step_consume_queue=step_consume_queue,
+            step_ingest_sqlite=step_ingest_sqlite,
+            step_download_images=step_download_images,
+            now_iso=now_iso,
+            max_need_fetch_enqueue_per_run=MAX_NEED_FETCH_ENQUEUE_PER_RUN,
+        )
 
-        if kv_get(con, "dbver_changed", "0") == "1":
-            # NOTE(引き継ぎ): dbver差分検知後はfetch_statusをNEED_FETCHに戻すだけ。
-            # 実際の再取得はキュー経由で少しずつ進める（処理時間のスパイク回避）。
-            con.execute("UPDATE cards_raw SET fetch_status='NEED_FETCH' WHERE konami_id IS NOT NULL")
-            kv_set(con, "dbver_changed", "0")
-            con.commit()
-
-        queue_requeue_errors(con)
-
-        if not queue_has_pending(con):
-            # NOTE(引き継ぎ): 現在の実装は「キューが空ならNEED_FETCHを再投入」まで。
-            # 仕様書にあるoffsetベースのfull sync(1ページ進行)は別途接続が必要。
-            enqueue_need_fetch_cards(con, MAX_NEED_FETCH_ENQUEUE_PER_RUN)
-
-        # B) キュー優先
-        q_done = step_consume_queue(con, api, dbver_hash=dbver_hash)
-
-        # C) SQLite一括取り込み
-        ingested = step_ingest_sqlite(con, dbver_hash=dbver_hash)
-
-        kv_set(con, "last_run_at", now_iso())
-        con.commit()
-
-        images_done = step_download_images(con, api)
-
-        print(f"[OK] run: queue_done={q_done}, ingested_cards={ingested}, images_done={images_done}, api_calls={api.api_calls}")
+        print(
+            "[OK] run: "
+            f"queue_done={result.queue_done}, "
+            f"ingested_cards={result.ingested_cards}, "
+            f"images_done={result.images_done}, "
+            f"api_calls={result.api_calls}"
+        )
         return 0
 
     except Exception as e:
@@ -801,37 +796,12 @@ def cmd_queue_add(konami_id: Optional[int], keyword: Optional[str]) -> int:
 
 
 def main(argv: List[str]) -> int:
-    parser = argparse.ArgumentParser(description="YGOPRODeck API v7 定期取得デーモン（SQLiteロスレス保存）")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    sub.add_parser("initdb", help="SQLite初期化（テーブル作成）")
-
-    p_add = sub.add_parser(
-        "queue-add",
-        help="KONAMI_ID または キーワードをキューに追加",
-        epilog=(
-            "例:\n"
-            "  python main.py queue-add --konami-id 12345678\n"
-            "  python main.py queue-add --keyword Blue-Eyes"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    return dispatch(
+        argv,
+        cmd_initdb=cmd_initdb,
+        cmd_queue_add=cmd_queue_add,
+        cmd_run_once=run_once,
     )
-    group = p_add.add_mutually_exclusive_group(required=True)
-    group.add_argument("--konami-id", type=int, help="KONAMI_IDでカード詳細取得を予約")
-    group.add_argument("--keyword", type=str, help="キーワードでカード詳細取得を予約")
-
-    sub.add_parser("run", help="1回実行（タスクスケジューラで定期起動する想定）")
-
-    args = parser.parse_args(argv)
-
-    if args.cmd == "initdb":
-        return cmd_initdb()
-    if args.cmd == "queue-add":
-        return cmd_queue_add(args.konami_id, args.keyword)
-    if args.cmd == "run":
-        return run_once()
-
-    return 2
 
 
 if __name__ == "__main__":
