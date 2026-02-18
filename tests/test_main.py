@@ -126,7 +126,9 @@ def test_step_download_images_skips_existing_file(temp_db: sqlite3.Connection, t
     monkeypatch.setattr(main, "TEMP_IMAGE_DIR", temp_dir)
 
     existing = image_dir / "100.jpg"
+    existing_cropped = image_dir / "100_cropped.jpg"
     existing.write_bytes(b"already")
+    existing_cropped.write_bytes(b"already-cropped")
 
     temp_db.execute(
         """
@@ -136,8 +138,10 @@ def test_step_download_images_skips_existing_file(temp_db: sqlite3.Connection, t
     )
     temp_db.execute(
         """
-        INSERT INTO card_images(card_id, image_url, image_path, fetch_status, last_error, updated_at)
-        VALUES(100, 'https://img/100.jpg', NULL, 'NEED_FETCH', NULL, datetime('now'))
+        INSERT INTO card_images(
+          card_id, image_url, image_url_cropped, image_path, image_path_cropped, fetch_status, last_error, updated_at
+        )
+        VALUES(100, 'https://img/100.jpg', 'https://img/100c.jpg', NULL, NULL, 'NEED_FETCH', NULL, datetime('now'))
         """
     )
     temp_db.commit()
@@ -152,10 +156,11 @@ def test_step_download_images_skips_existing_file(temp_db: sqlite3.Connection, t
     downloaded = main.step_download_images(temp_db, api, limit=10)
     assert downloaded == 0
 
-    row = temp_db.execute("SELECT image_path, fetch_status FROM card_images WHERE card_id=100").fetchone()
+    row = temp_db.execute("SELECT image_path, image_path_cropped, fetch_status FROM card_images WHERE card_id=100").fetchone()
     assert row is not None
     assert row["fetch_status"] == "OK"
     assert row["image_path"] == str(existing)
+    assert row["image_path_cropped"] == str(existing_cropped)
 
 
 def test_is_valid_next_offset() -> None:
