@@ -8,6 +8,7 @@ from app.config import load_help_text
 
 CommandHandler = Callable[[], int]
 QueueAddHandler = Callable[[int | None, str | None], int]
+DictBuildHandler = Callable[[int | None, int | None, bool, str | None], int]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("run", help=load_help_text("run_help.txt", fallback="1回実行（タスクスケジューラで定期起動する想定）"))
+    p_dict = sub.add_parser("dict-build", help="辞書生成を1回実行")
+    p_dict.add_argument("--max-runtime-sec", type=int, default=None)
+    p_dict.add_argument("--batch-size", type=int, default=None)
+    p_dict.add_argument("--dry-run", action="store_true")
+    p_dict.add_argument("--log-level", type=str, default=None)
     return parser
 
 
@@ -56,6 +62,7 @@ def dispatch(
     cmd_initdb: CommandHandler,
     cmd_queue_add: QueueAddHandler,
     cmd_run_once: CommandHandler,
+    cmd_dict_build: DictBuildHandler,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -66,4 +73,6 @@ def dispatch(
         return cmd_queue_add(args.konami_id, args.keyword)
     if args.cmd == "run":
         return cmd_run_once()
+    if args.cmd == "dict-build":
+        return cmd_dict_build(args.max_runtime_sec, args.batch_size, args.dry_run, args.log_level)
     return 2

@@ -31,6 +31,15 @@ class AppConfig:
     keyword_timeout_sec: int
     keyword_max_retries: int
     keyword_search_param: str
+    dict_builder_max_runtime_sec: int
+    dict_builder_batch_size: int
+    dict_ruleset_version: str
+    dict_accept_threshold_cost: int
+    dict_accept_threshold_action: int
+    dict_accept_threshold_trigger: int
+    dict_accept_threshold_restriction: int
+    dict_accept_threshold_condition: int
+    dict_accept_threshold_unclassified: int
     log_level: str
 
 
@@ -60,6 +69,15 @@ def load_app_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         keyword_timeout_sec=parser.getint("keyword_fetch", "default_timeout_sec", fallback=15),
         keyword_max_retries=parser.getint("keyword_fetch", "default_max_retries", fallback=2),
         keyword_search_param=parser.get("keyword_fetch", "default_search_param", fallback="fname"),
+        dict_builder_max_runtime_sec=parser.getint("dict_builder", "max_runtime_sec", fallback=20),
+        dict_builder_batch_size=parser.getint("dict_builder", "batch_size", fallback=200),
+        dict_ruleset_version=parser.get("dict_builder", "ruleset_version", fallback="v3.0"),
+        dict_accept_threshold_cost=parser.getint("dict_builder", "accept_threshold_cost", fallback=2),
+        dict_accept_threshold_action=parser.getint("dict_builder", "accept_threshold_action", fallback=3),
+        dict_accept_threshold_trigger=parser.getint("dict_builder", "accept_threshold_trigger", fallback=4),
+        dict_accept_threshold_restriction=parser.getint("dict_builder", "accept_threshold_restriction", fallback=2),
+        dict_accept_threshold_condition=parser.getint("dict_builder", "accept_threshold_condition", fallback=4),
+        dict_accept_threshold_unclassified=parser.getint("dict_builder", "accept_threshold_unclassified", fallback=6),
         log_level=parser.get("logging", "log_level", fallback="INFO").upper(),
     )
 

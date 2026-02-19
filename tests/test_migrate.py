@@ -10,7 +10,7 @@ def test_apply_migrations_initializes_schema(tmp_path: Path) -> None:
     con = sqlite3.connect(tmp_path / "db.sqlite3")
     try:
         applied = apply_migrations(con, Path("app/db/migrations"))
-        assert applied == 5
+        assert applied == 7
 
         tables = {
             row[0]
@@ -28,11 +28,11 @@ def test_apply_migrations_initializes_schema(tmp_path: Path) -> None:
 def test_apply_migrations_is_idempotent(tmp_path: Path) -> None:
     con = sqlite3.connect(tmp_path / "db.sqlite3")
     try:
-        assert apply_migrations(con, Path("app/db/migrations")) == 5
+        assert apply_migrations(con, Path("app/db/migrations")) == 7
         assert apply_migrations(con, Path("app/db/migrations")) == 0
 
         count = con.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-        assert count == 5
+        assert count == 7
     finally:
         con.close()
 

@@ -31,6 +31,7 @@ from requests.exceptions import RequestException
 
 from app.cli import dispatch
 from app.config import DB_PATH, load_app_config
+from app.dict_builder import DictBuilderConfig, run_incremental_build
 from app.infra.migrate import apply_migrations
 from app.orchestrator import execute_run_cycle
 
@@ -59,6 +60,7 @@ FULLSYNC_NUM = APP_CONFIG.fullsync_num
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 LOCK_DIR = DATA_DIR / "lock"
+DICT_LOCK_DIR = DATA_DIR / "locks"
 STAGING_DIR = DATA_DIR / "staging"
 LOG_DIR = DATA_DIR / "logs"
 IMAGE_DIR = DATA_DIR / "image" / "card"
@@ -67,8 +69,22 @@ FAILED_INGEST_DIR = DATA_DIR / "failed"
 DB_DIR = DATA_DIR / "db"
 
 LOCK_PATH = LOCK_DIR / "daemon.lock"
+DICT_LOCK_PATH = DICT_LOCK_DIR / "dict_builder.lock"
+DICT_LOG_PATH = LOG_DIR / "dict_builder.log"
 LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", APP_CONFIG.log_level).upper()
+DICT_LOG_LEVEL = os.getenv("YGO_DICT_LOG_LEVEL", APP_CONFIG.log_level).upper()
 IMAGE_DOWNLOAD_LIMIT_PER_RUN = APP_CONFIG.image_download_limit_per_run
+DICT_BUILDER_MAX_RUNTIME_SEC = APP_CONFIG.dict_builder_max_runtime_sec
+DICT_BUILDER_BATCH_SIZE = APP_CONFIG.dict_builder_batch_size
+DICT_RULESET_VERSION = APP_CONFIG.dict_ruleset_version
+DICT_ACCEPT_THRESHOLDS = {
+    "cost_patterns": APP_CONFIG.dict_accept_threshold_cost,
+    "action_patterns": APP_CONFIG.dict_accept_threshold_action,
+    "trigger_patterns": APP_CONFIG.dict_accept_threshold_trigger,
+    "restriction_patterns": APP_CONFIG.dict_accept_threshold_restriction,
+    "condition_patterns": APP_CONFIG.dict_accept_threshold_condition,
+    "unclassified_patterns": APP_CONFIG.dict_accept_threshold_unclassified,
+}
 
 LOGGER = logging.getLogger("ygo-daemon")
 
@@ -81,7 +97,7 @@ def now_iso() -> str:
 
 
 def ensure_dirs() -> None:
-    for p in [DATA_DIR, DB_DIR, LOCK_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, TEMP_IMAGE_DIR, FAILED_INGEST_DIR]:
+    for p in [DATA_DIR, DB_DIR, LOCK_DIR, DICT_LOCK_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, TEMP_IMAGE_DIR, FAILED_INGEST_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -103,6 +119,7 @@ def configure_logging() -> None:
 
 
 def acquire_lock() -> bool:
+    """単純ロックファイルを作成し、多重起動を防ぐ。"""
     ensure_dirs()
     try:
         with LOCK_PATH.open("x", encoding="utf-8") as lock_file:
@@ -113,6 +130,7 @@ def acquire_lock() -> bool:
 
 
 def release_lock() -> None:
+    """ロックファイルを削除する。異常系でも終了処理を優先して例外は握りつぶす。"""
     try:
         if LOCK_PATH.exists():
             LOCK_PATH.unlink()
@@ -479,6 +497,7 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
         keyword = row["keyword"]
 
         try:
+            # 1キュー項目につき API 呼び出しは1回のみ。成功時だけ DONE へ進める。
             if konami_id is not None:
                 res = api.cardinfo_by_konami_id(konami_id)
                 source = "queue"
@@ -491,11 +510,14 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
             # 取得できない（data空）場合も運用上は「DONE」扱いにするか悩むところ。
             # 初期は「DONE」にして、必要なら別途再投入する運用が安定。
             LOGGER.info("parse_result qid=%s source=%s cards=%s", qid, source, len(res.data))
+            # data=[] の場合でも「問い合わせ済み」として DONE 扱いにする。
+            # 再調査が必要なIDは運用側で再投入する運用を前提とする。
             staging_write_cards(res.data, source=source)
             queue_mark_done(con, qid)
             done += 1
         except Exception as e:
             LOGGER.error("queue item failed (qid=%s, konami_id=%s, keyword=%s): %s", qid, konami_id, keyword, e)
+            # ERROR に落として次周回で再投入する。run 全体は止めない。
             queue_mark_retry(con, qid, str(e))
             if konami_id is not None:
                 mark_need_fetch_by_konami_id(con, konami_id)
@@ -507,6 +529,7 @@ def step_consume_queue(con: sqlite3.Connection, api: ApiClient, dbver_hash: str)
 # ステップC：全件同期（offset/num）→ JSONL蓄積
 # =========================
 def get_fullsync_state(con: sqlite3.Connection) -> tuple[int, int, bool]:
+    """fullsync 進捗を kv_store から取得し、安全な初期値へ正規化する。"""
     offset = max(0, kv_get_int(con, "fullsync_offset", 0))
     num = kv_get_int(con, "fullsync_num", FULLSYNC_NUM)
     if num <= 0:
@@ -516,6 +539,7 @@ def get_fullsync_state(con: sqlite3.Connection) -> tuple[int, int, bool]:
 
 
 def set_fullsync_state(con: sqlite3.Connection, *, offset: int | None = None, num: int | None = None, done: bool | None = None) -> None:
+    """fullsync 進捗を必要項目だけ更新する。"""
     if offset is not None:
         kv_set_int(con, "fullsync_offset", max(0, offset))
     if num is not None and num > 0:
@@ -530,6 +554,7 @@ def is_valid_next_offset(next_offset: Any, current_offset: int) -> bool:
 
 
 def step_fullsync_once(con: sqlite3.Connection, api: ApiClient) -> tuple[bool, int, int, int | None]:
+    """queue 消化後の余力で fullsync を1ページだけ進める。"""
     current_offset, num, done = get_fullsync_state(con)
     if done:
         LOGGER.info("fullsync_skip reason=done")
@@ -542,8 +567,10 @@ def step_fullsync_once(con: sqlite3.Connection, api: ApiClient) -> tuple[bool, i
     next_offset_raw = result.meta.get("next_page_offset")
     next_offset = try_int(next_offset_raw)
     if is_valid_next_offset(next_offset_raw, current_offset):
+        # API が次ページを示した場合のみ offset を前進させる。
         set_fullsync_state(con, offset=int(next_offset), done=False, num=num)
     else:
+        # next_page_offset が欠落/不正/後退値なら完了扱いで停止。
         next_offset = None
         set_fullsync_state(con, done=True, num=num)
 
@@ -778,6 +805,8 @@ def ingest_one_file(con: sqlite3.Connection, path: Path, dbver_hash: str) -> Tup
             source = "full_sync"
 
         with path.open("r", encoding="utf-8") as f:
+            # 1ファイル単位でトランザクションを閉じることで、
+            # 途中失敗時は当該ファイルのみロールバックできる。
             con.execute("BEGIN")
             for line in f:
                 line = line.strip()
@@ -797,6 +826,7 @@ def ingest_one_file(con: sqlite3.Connection, path: Path, dbver_hash: str) -> Tup
 
 
 def ingest_finalize(con: sqlite3.Connection, path: Path, status: str, err: Optional[str]) -> None:
+    """ingest 管理テーブルの状態を更新する。"""
     con.execute(
         """
         UPDATE ingest_files
@@ -844,6 +874,7 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
 # runner（1回実行）
 # =========================
 def run_once() -> int:
+    """デーモン1サイクル実行。失敗時もロック解放だけは必ず行う。"""
     configure_logging()
     started = time.monotonic()
     LOGGER.info(
@@ -947,12 +978,61 @@ def cmd_queue_add(konami_id: Optional[int], keyword: Optional[str]) -> int:
         con.close()
 
 
+def cmd_dict_build(max_runtime_sec: Optional[int], batch_size: Optional[int], dry_run: bool, log_level: Optional[str]) -> int:
+    """辞書増分構築コマンド。実処理は run_incremental_build に委譲する。"""
+    configure_logging()
+    con = db_connect()
+    try:
+        ensure_schema(con)
+        stats = run_incremental_build(
+            con,
+            DictBuilderConfig(
+                lock_path=DICT_LOCK_PATH,
+                log_path=DICT_LOG_PATH,
+                log_level=(log_level or DICT_LOG_LEVEL).upper(),
+                max_runtime_sec=max_runtime_sec if max_runtime_sec is not None else DICT_BUILDER_MAX_RUNTIME_SEC,
+                batch_size=batch_size if batch_size is not None else DICT_BUILDER_BATCH_SIZE,
+                ruleset_version=DICT_RULESET_VERSION,
+                dry_run=dry_run,
+                accept_thresholds=DICT_ACCEPT_THRESHOLDS,
+            ),
+        )
+        LOGGER.info(
+            "dict_build_summary processed_cards=%s new_phrases=%s updated_phrases=%s promoted_phrases=%s rejected_phrases=%s stop_reason=%s",
+            stats.processed_cards,
+            stats.new_phrases,
+            stats.updated_phrases,
+            stats.promoted_phrases,
+            stats.rejected_phrases,
+            stats.stop_reason,
+        )
+        if stats.stop_reason == "exception":
+            return 1
+        print(
+            "[OK] dict-build: "
+            f"processed_cards={stats.processed_cards}, "
+            f"new_phrases={stats.new_phrases}, "
+            f"updated_phrases={stats.updated_phrases}, "
+            f"promoted_phrases={stats.promoted_phrases}, "
+            f"rejected_phrases={stats.rejected_phrases}, "
+            f"stop_reason={stats.stop_reason}"
+        )
+        return 0
+    except Exception as e:
+        LOGGER.error("dict-build failed: %s", e, exc_info=LOG_LEVEL == "DEBUG")
+        print(f"[ERROR] {e}")
+        return 1
+    finally:
+        con.close()
+
+
 def main(argv: List[str]) -> int:
     return dispatch(
         argv,
         cmd_initdb=cmd_initdb,
         cmd_queue_add=cmd_queue_add,
         cmd_run_once=run_once,
+        cmd_dict_build=cmd_dict_build,
     )
 
 
