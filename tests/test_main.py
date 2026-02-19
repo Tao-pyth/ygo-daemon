@@ -36,23 +36,6 @@ class DummySession:
         return step
 
 
-@pytest.fixture
-def temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> sqlite3.Connection:
-    monkeypatch.setattr(main, "DATA_DIR", tmp_path / "data")
-    monkeypatch.setattr(main, "LOCK_DIR", main.DATA_DIR / "lock")
-    monkeypatch.setattr(main, "STAGING_DIR", main.DATA_DIR / "staging")
-    monkeypatch.setattr(main, "LOG_DIR", main.DATA_DIR / "logs")
-    monkeypatch.setattr(main, "DB_DIR", main.DATA_DIR / "db")
-    monkeypatch.setattr(main, "DB_PATH", main.DB_DIR / "ygo.sqlite3")
-    monkeypatch.setattr(main, "TEMP_IMAGE_DIR", main.DATA_DIR / "image" / "temp")
-    monkeypatch.setattr(main, "FAILED_INGEST_DIR", main.DATA_DIR / "failed")
-    monkeypatch.setattr(main, "LOCK_PATH", main.LOCK_DIR / "daemon.lock")
-
-    con = main.db_connect()
-    main.ensure_schema(con)
-    yield con
-    con.close()
-
 
 def test_extract_konami_id_from_misc_info() -> None:
     card = {"misc_info": [{"konami_id": "1234"}]}
