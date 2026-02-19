@@ -31,7 +31,7 @@ from requests.exceptions import RequestException
 
 from app.cli import dispatch
 from app.config import DB_PATH, load_app_config
-from app.dict_builder import DictBuilderConfig, run_incremental_build
+from app.usecase.dict_build import DictBuilderConfig, run_incremental_build
 from app.infra.migrate import apply_migrations
 from app.orchestrator import execute_run_cycle
 
