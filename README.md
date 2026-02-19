@@ -57,11 +57,15 @@ python main.py queue-add --konami-id 12345678
 python main.py queue-add --keyword "Blue-Eyes"
 python main.py run
 python main.py dict-build
+python main.py dict-dump --out data/exports/dict_dump.jsonl --format jsonl
+python main.py db-dump --tables kv_store,request_queue --out data/exports/db_dump.csv --format csv
 ```
 
 - `queue-add` は `--konami-id` / `--keyword` の排他指定
 - `run` は1回だけ実行（繰り返しはスケジューラ側で設定）
 - `dict-build` は辞書構築処理を増分実行
+- `dict-dump` は辞書系管理テーブル（既定: `dsl_dictionary_patterns`,`dsl_dictionary_terms`,`kv_store`）を一括出力
+- `db-dump` は `--tables` 指定の管理テーブルを一括出力（`cards_raw` / `cards_index` は対象外）
 
 ---
 

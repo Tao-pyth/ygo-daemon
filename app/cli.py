@@ -9,6 +9,7 @@ from app.config import load_help_text
 CommandHandler = Callable[[], int]
 QueueAddHandler = Callable[[int | None, str | None], int]
 DictBuildHandler = Callable[[int | None, int | None, bool, str | None], int]
+DumpHandler = Callable[[str | None, str, str], int]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +54,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_dict.add_argument("--batch-size", type=int, default=None)
     p_dict.add_argument("--dry-run", action="store_true")
     p_dict.add_argument("--log-level", type=str, default=None)
+
+    p_dict_dump = sub.add_parser("dict-dump", help="辞書関連管理テーブルを一括ダンプ")
+    p_dict_dump.add_argument("--tables", type=str, default=None, help="カンマ区切りテーブル名（省略時は標準3テーブル）")
+    p_dict_dump.add_argument("--out", type=str, required=True, help="出力ファイルパス")
+    p_dict_dump.add_argument("--format", choices=["jsonl", "csv"], default="jsonl")
+
+    p_db_dump = sub.add_parser("db-dump", help="管理テーブルを指定して全件ダンプ")
+    p_db_dump.add_argument("--tables", type=str, required=True, help="カンマ区切りテーブル名")
+    p_db_dump.add_argument("--out", type=str, required=True, help="出力ファイルパス")
+    p_db_dump.add_argument("--format", choices=["jsonl", "csv"], default="jsonl")
     return parser
 
 
@@ -63,6 +74,8 @@ def dispatch(
     cmd_queue_add: QueueAddHandler,
     cmd_run_once: CommandHandler,
     cmd_dict_build: DictBuildHandler,
+    cmd_dict_dump: DumpHandler,
+    cmd_db_dump: DumpHandler,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -75,4 +88,8 @@ def dispatch(
         return cmd_run_once()
     if args.cmd == "dict-build":
         return cmd_dict_build(args.max_runtime_sec, args.batch_size, args.dry_run, args.log_level)
+    if args.cmd == "dict-dump":
+        return cmd_dict_dump(args.tables, args.out, args.format)
+    if args.cmd == "db-dump":
+        return cmd_db_dump(args.tables, args.out, args.format)
     return 2

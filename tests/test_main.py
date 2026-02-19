@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from pathlib import Path
 from typing import Any
 
@@ -222,3 +223,47 @@ def test_cli_dict_build_forwards_options(monkeypatch: pytest.MonkeyPatch) -> Non
         "dry_run": True,
         "log_level": "DEBUG",
     }
+
+
+def test_cli_dict_dump_forwards_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_cmd(tables: str | None, out: str, fmt: str) -> int:
+        captured["tables"] = tables
+        captured["out"] = out
+        captured["fmt"] = fmt
+        return 0
+
+    monkeypatch.setattr(main, "cmd_dict_dump", fake_cmd)
+
+    code = main.main(["dict-dump", "--tables", "kv_store", "--out", "data/exports/dump.jsonl", "--format", "jsonl"])
+
+    assert code == 0
+    assert captured == {
+        "tables": "kv_store",
+        "out": "data/exports/dump.jsonl",
+        "fmt": "jsonl",
+    }
+
+
+def test_cmd_dict_dump_writes_jsonl(temp_db: sqlite3.Connection, tmp_path: Path) -> None:
+    main.kv_set(temp_db, "sample_key", "sample_value")
+    temp_db.commit()
+
+    out = tmp_path / "exports" / "dict_dump.jsonl"
+    code = main.cmd_dict_dump("kv_store", str(out), "jsonl")
+
+    assert code == 0
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 1
+    first = json.loads(lines[0])
+    assert first["table"] == "kv_store"
+    assert "row" in first
+
+
+def test_cmd_db_dump_rejects_cards_raw(temp_db: sqlite3.Connection, tmp_path: Path) -> None:
+    out = tmp_path / "exports" / "db_dump.jsonl"
+
+    code = main.cmd_db_dump("cards_raw", str(out), "jsonl")
+
+    assert code == 2
