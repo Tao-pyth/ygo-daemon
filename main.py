@@ -33,6 +33,7 @@ from app.cli import dispatch
 from app.config import DB_PATH, load_app_config
 from app.usecase.dict_build import DictBuilderConfig, run_incremental_build
 from app.infra.migrate import apply_migrations
+from app.infra.table_dump import TableDumpError, dump_tables, parse_tables_arg, validate_tables
 from app.orchestrator import execute_run_cycle
 
 
@@ -1026,6 +1027,35 @@ def cmd_dict_build(max_runtime_sec: Optional[int], batch_size: Optional[int], dr
         con.close()
 
 
+def _cmd_dump(tables_text: Optional[str], out: str, fmt: str, *, use_default_tables: bool) -> int:
+    con = db_connect()
+    try:
+        ensure_schema(con)
+        default_tables = None if not use_default_tables else (
+            "dsl_dictionary_patterns",
+            "dsl_dictionary_terms",
+            "kv_store",
+        )
+        tables = parse_tables_arg(tables_text, default_tables=default_tables or ())
+        tables = validate_tables(con, tables)
+        exported = dump_tables(con, tables=tables, out_path=Path(out), fmt=fmt)
+        print(f"[OK] dump: tables={','.join(tables)} rows={exported} format={fmt} out={out}")
+        return 0
+    except TableDumpError as e:
+        print(f"[ERROR] {e}")
+        return 2
+    finally:
+        con.close()
+
+
+def cmd_dict_dump(tables_text: Optional[str], out: str, fmt: str) -> int:
+    return _cmd_dump(tables_text, out, fmt, use_default_tables=True)
+
+
+def cmd_db_dump(tables_text: Optional[str], out: str, fmt: str) -> int:
+    return _cmd_dump(tables_text, out, fmt, use_default_tables=False)
+
+
 def main(argv: List[str]) -> int:
     return dispatch(
         argv,
@@ -1033,6 +1063,8 @@ def main(argv: List[str]) -> int:
         cmd_queue_add=cmd_queue_add,
         cmd_run_once=run_once,
         cmd_dict_build=cmd_dict_build,
+        cmd_dict_dump=cmd_dict_dump,
+        cmd_db_dump=cmd_db_dump,
     )
 
 
