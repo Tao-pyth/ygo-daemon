@@ -199,3 +199,26 @@ def test_step_fullsync_once_marks_done_on_invalid_next_offset(temp_db: sqlite3.C
     assert upserts == 1
     assert next_offset is None
     assert main.kv_get(temp_db, "fullsync_done") == "1"
+
+
+def test_cli_dict_build_forwards_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_cmd(max_runtime_sec: int | None, batch_size: int | None, dry_run: bool, log_level: str | None) -> int:
+        captured["max_runtime_sec"] = max_runtime_sec
+        captured["batch_size"] = batch_size
+        captured["dry_run"] = dry_run
+        captured["log_level"] = log_level
+        return 0
+
+    monkeypatch.setattr(main, "cmd_dict_build", fake_cmd)
+
+    code = main.main(["dict-build", "--max-runtime-sec", "10", "--batch-size", "5", "--dry-run", "--log-level", "DEBUG"])
+
+    assert code == 0
+    assert captured == {
+        "max_runtime_sec": 10,
+        "batch_size": 5,
+        "dry_run": True,
+        "log_level": "DEBUG",
+    }

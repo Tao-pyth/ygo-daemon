@@ -5,11 +5,10 @@ import logging
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
 
 
 ZONES: dict[str, str] = {
@@ -30,10 +29,49 @@ TARGETS: dict[str, str] = {
     "card": "{TARGET_CARD}",
 }
 
-COST_PATTERNS = [r"\bpay \{N\} lp\b", r"\bdiscard \{N\} card", r"\btribute \{N\} monster"]
-ACTION_PATTERNS = [r"\bdraw \{N\} cards?", r"\bdestroy \{N\}", r"\badd \{N\}", r"\bspecial summon \{N\}"]
-RESTRICTION_PATTERNS = [r"\bonce per turn\b", r"\byou can only use this effect"]
-TRIGGER_PATTERNS = [r"\bwhen this card is normal summoned\b", r"\bif this card is sent to the gy\b", r"\bwhen\b", r"\bif\b"]
+CATEGORY_PRIORITY: dict[str, int] = {
+    "cost_patterns": 90,
+    "action_patterns": 80,
+    "restriction_patterns": 70,
+    "trigger_patterns": 60,
+    "condition_patterns": 40,
+    "unclassified_patterns": 10,
+}
+
+
+@dataclass(frozen=True)
+class PatternRule:
+    category: str
+    name: str
+    regex: str
+
+
+PATTERN_RULES: list[PatternRule] = [
+    PatternRule("cost_patterns", "pay_lp", r"\bpay \{N\} lp\b"),
+    PatternRule("cost_patterns", "discard_cost", r"\bdiscard \{N\} cards?\b"),
+    PatternRule("cost_patterns", "tribute_cost", r"\btribute \{N\} monsters?\b"),
+    PatternRule("action_patterns", "add_from_deck_to_hand", r"\badd \{N\} .* from \{ZONE_DECK\} to \{ZONE_HAND\}\b"),
+    PatternRule("action_patterns", "special_summon_from_zone", r"\bspecial summon \{N\} .* from \{ZONE_[A-Z_]+\}\b"),
+    PatternRule("action_patterns", "draw_cards", r"\bdraw \{N\} (cards?|\{TARGET_CARD\})(\.|\b)"),
+    PatternRule("action_patterns", "destroy_target", r"\bdestroy \{N\} .*\b"),
+    PatternRule("restriction_patterns", "once_per_turn", r"\bonce per turn\b"),
+    PatternRule("restriction_patterns", "only_use_effect", r"\byou can only use this effect\b"),
+    PatternRule("trigger_patterns", "normal_summoned", r"\bwhen this card is normal summoned\b"),
+    PatternRule("trigger_patterns", "special_summoned", r"\bwhen this card is special summoned\b"),
+    PatternRule("trigger_patterns", "sent_to_gy", r"\bif this card is sent to the \{ZONE_GRAVE\}\b"),
+    PatternRule("trigger_patterns", "destroyed", r"\bif this card is destroyed\b"),
+]
+
+CONDITION_RULES: list[PatternRule] = [
+    PatternRule("condition_patterns", "if_clause", r"\bif\b"),
+    PatternRule("condition_patterns", "when_clause", r"\bwhen\b"),
+]
+
+
+@dataclass(frozen=True)
+class CategoryDecision:
+    category: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -41,6 +79,8 @@ class DictBuildStats:
     processed_cards: int = 0
     new_phrases: int = 0
     updated_phrases: int = 0
+    promoted_phrases: int = 0
+    rejected_phrases: int = 0
     stop_reason: str = "completed"
 
 
@@ -52,6 +92,8 @@ class DictBuilderConfig:
     max_runtime_sec: int
     batch_size: int
     ruleset_version: str
+    dry_run: bool = False
+    accept_thresholds: dict[str, int] = field(default_factory=dict)
 
 
 def now_iso() -> str:
@@ -108,17 +150,33 @@ def normalize_template(sentence: str) -> str:
     return normalized
 
 
-def detect_category(template: str) -> str | None:
-    checks: list[tuple[str, list[str]]] = [
-        ("cost_patterns", COST_PATTERNS),
-        ("action_patterns", ACTION_PATTERNS),
-        ("restriction_patterns", RESTRICTION_PATTERNS),
-        ("trigger_patterns", TRIGGER_PATTERNS),
-    ]
-    for category, patterns in checks:
-        if any(re.search(pattern, template) for pattern in patterns):
-            return category
-    return None
+def _decision_score(template: str, match_text: str, category: str) -> tuple[int, int, int]:
+    return (
+        len(match_text),
+        template.count("{"),
+        CATEGORY_PRIORITY.get(category, 0),
+    )
+
+
+def detect_category(template: str) -> CategoryDecision:
+    best: tuple[tuple[int, int, int], CategoryDecision] | None = None
+    for rule in PATTERN_RULES:
+        match = re.search(rule.regex, template)
+        if not match:
+            continue
+        score = _decision_score(template, match.group(0), rule.category)
+        decision = CategoryDecision(rule.category, f"rule={rule.name} match_len={len(match.group(0))} placeholders={template.count('{')}")
+        if best is None or score > best[0]:
+            best = (score, decision)
+
+    if best is not None:
+        return best[1]
+
+    for rule in CONDITION_RULES:
+        if re.search(rule.regex, template):
+            return CategoryDecision(rule.category, f"rule={rule.name}")
+
+    return CategoryDecision("unclassified_patterns", "rule=fallback_unclassified")
 
 
 def _upsert_phrase(
@@ -203,10 +261,71 @@ def _extract_card_sentences(raw_json: str) -> list[str]:
     return split_sentences(desc)
 
 
+def _resolve_threshold(config: DictBuilderConfig, category: str) -> int:
+    defaults = {
+        "cost_patterns": 2,
+        "action_patterns": 3,
+        "trigger_patterns": 4,
+        "restriction_patterns": 2,
+        "condition_patterns": 4,
+        "unclassified_patterns": 6,
+    }
+    return int(config.accept_thresholds.get(category, defaults.get(category, 3)))
+
+
+def _should_auto_reject(category: str, template: str) -> bool:
+    if category in {"condition_patterns", "trigger_patterns"} and template in {"if", "when"}:
+        return True
+    if len(template.split()) <= 2 and "{" not in template:
+        return True
+    return False
+
+
+def _apply_status_rules(
+    con: sqlite3.Connection,
+    *,
+    category: str,
+    template: str,
+    ruleset_version: str,
+    threshold: int,
+    captured_at: str,
+) -> tuple[bool, bool]:
+    row = con.execute(
+        "SELECT count, status FROM dsl_dictionary_patterns WHERE category=? AND template=? AND dict_ruleset_version=?",
+        (category, template, ruleset_version),
+    ).fetchone()
+    if row is None:
+        return (False, False)
+
+    count = int(row["count"])
+    status = str(row["status"])
+
+    if status == "candidate" and _should_auto_reject(category, template):
+        con.execute(
+            "UPDATE dsl_dictionary_patterns SET status='rejected', updated_at=? WHERE category=? AND template=? AND dict_ruleset_version=?",
+            (captured_at, category, template, ruleset_version),
+        )
+        return (False, True)
+
+    if status == "candidate" and count >= threshold:
+        con.execute(
+            "UPDATE dsl_dictionary_patterns SET status='accepted', updated_at=? WHERE category=? AND template=? AND dict_ruleset_version=?",
+            (captured_at, category, template, ruleset_version),
+        )
+        return (True, False)
+
+    return (False, False)
+
+
 def run_incremental_build(con: sqlite3.Connection, config: DictBuilderConfig) -> DictBuildStats:
     logger = configure_logger(config.log_path, config.log_level)
     started = time.monotonic()
-    logger.info("dict_build_start max_runtime_sec=%s batch_size=%s", config.max_runtime_sec, config.batch_size)
+    logger.info(
+        "dict_build_start max_runtime_sec=%s batch_size=%s dry_run=%s",
+        config.max_runtime_sec,
+        config.batch_size,
+        config.dry_run,
+    )
 
     if not acquire_lock(config.lock_path):
         logger.info("dict_build_skip reason=lock_exists lock_path=%s", config.lock_path)
@@ -215,7 +334,10 @@ def run_incremental_build(con: sqlite3.Connection, config: DictBuilderConfig) ->
     processed_cards = 0
     new_phrases = 0
     updated_phrases = 0
+    promoted_phrases = 0
+    rejected_phrases = 0
     stop_reason = "completed"
+    category_stats: dict[str, dict[str, int]] = {}
 
     try:
         last_fetched_at = (
@@ -244,9 +366,10 @@ def run_incremental_build(con: sqlite3.Connection, config: DictBuilderConfig) ->
                 captured_at = now_iso()
                 templates = [_t for sentence in _extract_card_sentences(row["json"]) if (_t := normalize_template(sentence))]
                 for template in templates:
-                    category = detect_category(template)
-                    if category is None:
-                        continue
+                    decision = detect_category(template)
+                    category = decision.category
+                    category_stats.setdefault(category, {"new": 0, "updated": 0, "accepted": 0, "rejected": 0})
+
                     is_new = _upsert_phrase(
                         con,
                         category=category,
@@ -256,8 +379,32 @@ def run_incremental_build(con: sqlite3.Connection, config: DictBuilderConfig) ->
                     )
                     if is_new:
                         new_phrases += 1
+                        category_stats[category]["new"] += 1
                     else:
                         updated_phrases += 1
+                        category_stats[category]["updated"] += 1
+
+                    promoted, rejected = _apply_status_rules(
+                        con,
+                        category=category,
+                        template=template,
+                        ruleset_version=config.ruleset_version,
+                        threshold=_resolve_threshold(config, category),
+                        captured_at=captured_at,
+                    )
+                    if promoted:
+                        promoted_phrases += 1
+                        category_stats[category]["accepted"] += 1
+                    if rejected:
+                        rejected_phrases += 1
+                        category_stats[category]["rejected"] += 1
+
+                    logger.debug(
+                        "dict_pattern_detected category=%s reason=%s template=%s",
+                        category,
+                        decision.reason,
+                        template,
+                    )
 
                     for zone, placeholder in ZONES.items():
                         if placeholder in template:
@@ -292,7 +439,10 @@ def run_incremental_build(con: sqlite3.Connection, config: DictBuilderConfig) ->
                 "INSERT INTO kv_store(key,value) VALUES('dict_builder_last_card_id', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(last_card_id),),
             )
-            con.commit()
+            if config.dry_run:
+                con.rollback()
+            else:
+                con.commit()
 
     except Exception:
         logger.exception("dict_build_exception")
@@ -302,17 +452,30 @@ def run_incremental_build(con: sqlite3.Connection, config: DictBuilderConfig) ->
 
     elapsed_sec = time.monotonic() - started
     logger.info(
-        "dict_build_finish stop_reason=%s processed_cards=%s new_phrases=%s updated_phrases=%s elapsed_sec=%.3f",
+        "dict_build_finish stop_reason=%s processed_cards=%s new_phrases=%s updated_phrases=%s promoted_phrases=%s rejected_phrases=%s elapsed_sec=%.3f",
         stop_reason,
         processed_cards,
         new_phrases,
         updated_phrases,
+        promoted_phrases,
+        rejected_phrases,
         elapsed_sec,
     )
+    for category, stats in sorted(category_stats.items()):
+        logger.info(
+            "dict_build_category_summary category=%s new=%s updated=%s accepted=%s rejected=%s",
+            category,
+            stats["new"],
+            stats["updated"],
+            stats["accepted"],
+            stats["rejected"],
+        )
 
     return DictBuildStats(
         processed_cards=processed_cards,
         new_phrases=new_phrases,
         updated_phrases=updated_phrases,
+        promoted_phrases=promoted_phrases,
+        rejected_phrases=rejected_phrases,
         stop_reason=stop_reason,
     )
