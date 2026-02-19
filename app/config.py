@@ -31,6 +31,9 @@ class AppConfig:
     keyword_timeout_sec: int
     keyword_max_retries: int
     keyword_search_param: str
+    dict_builder_max_runtime_sec: int
+    dict_builder_batch_size: int
+    dict_ruleset_version: str
     log_level: str
 
 
@@ -60,6 +63,9 @@ def load_app_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         keyword_timeout_sec=parser.getint("keyword_fetch", "default_timeout_sec", fallback=15),
         keyword_max_retries=parser.getint("keyword_fetch", "default_max_retries", fallback=2),
         keyword_search_param=parser.get("keyword_fetch", "default_search_param", fallback="fname"),
+        dict_builder_max_runtime_sec=parser.getint("dict_builder", "max_runtime_sec", fallback=20),
+        dict_builder_batch_size=parser.getint("dict_builder", "batch_size", fallback=200),
+        dict_ruleset_version=parser.get("dict_builder", "ruleset_version", fallback="v3.0"),
         log_level=parser.get("logging", "log_level", fallback="INFO").upper(),
     )
 

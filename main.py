@@ -31,6 +31,7 @@ from requests.exceptions import RequestException
 
 from app.cli import dispatch
 from app.config import DB_PATH, load_app_config
+from app.dict_builder import DictBuilderConfig, run_incremental_build
 from app.infra.migrate import apply_migrations
 from app.orchestrator import execute_run_cycle
 
@@ -59,6 +60,7 @@ FULLSYNC_NUM = APP_CONFIG.fullsync_num
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 LOCK_DIR = DATA_DIR / "lock"
+DICT_LOCK_DIR = DATA_DIR / "locks"
 STAGING_DIR = DATA_DIR / "staging"
 LOG_DIR = DATA_DIR / "logs"
 IMAGE_DIR = DATA_DIR / "image" / "card"
@@ -67,8 +69,14 @@ FAILED_INGEST_DIR = DATA_DIR / "failed"
 DB_DIR = DATA_DIR / "db"
 
 LOCK_PATH = LOCK_DIR / "daemon.lock"
+DICT_LOCK_PATH = DICT_LOCK_DIR / "dict_builder.lock"
+DICT_LOG_PATH = LOG_DIR / "dict_builder.log"
 LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", APP_CONFIG.log_level).upper()
+DICT_LOG_LEVEL = os.getenv("YGO_DICT_LOG_LEVEL", APP_CONFIG.log_level).upper()
 IMAGE_DOWNLOAD_LIMIT_PER_RUN = APP_CONFIG.image_download_limit_per_run
+DICT_BUILDER_MAX_RUNTIME_SEC = APP_CONFIG.dict_builder_max_runtime_sec
+DICT_BUILDER_BATCH_SIZE = APP_CONFIG.dict_builder_batch_size
+DICT_RULESET_VERSION = APP_CONFIG.dict_ruleset_version
 
 LOGGER = logging.getLogger("ygo-daemon")
 
@@ -81,7 +89,7 @@ def now_iso() -> str:
 
 
 def ensure_dirs() -> None:
-    for p in [DATA_DIR, DB_DIR, LOCK_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, TEMP_IMAGE_DIR, FAILED_INGEST_DIR]:
+    for p in [DATA_DIR, DB_DIR, LOCK_DIR, DICT_LOCK_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, TEMP_IMAGE_DIR, FAILED_INGEST_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -880,6 +888,18 @@ def run_once() -> int:
             now_iso=now_iso,
         )
 
+        dict_stats = run_incremental_build(
+            con,
+            DictBuilderConfig(
+                lock_path=DICT_LOCK_PATH,
+                log_path=DICT_LOG_PATH,
+                log_level=DICT_LOG_LEVEL,
+                max_runtime_sec=DICT_BUILDER_MAX_RUNTIME_SEC,
+                batch_size=DICT_BUILDER_BATCH_SIZE,
+                ruleset_version=DICT_RULESET_VERSION,
+            ),
+        )
+
         elapsed = time.monotonic() - started
         LOGGER.info(
             "run_finish elapsed_sec=%.3f queue_done=%s fullsync_ran=%s fullsync_cards=%s fullsync_upserted=%s fullsync_next_offset=%s ingested_cards=%s images_done=%s api_calls=%s",
@@ -893,6 +913,13 @@ def run_once() -> int:
             result.images_done,
             result.api_calls,
         )
+        LOGGER.info(
+            "dict_build_summary processed_cards=%s new_phrases=%s updated_phrases=%s stop_reason=%s",
+            dict_stats.processed_cards,
+            dict_stats.new_phrases,
+            dict_stats.updated_phrases,
+            dict_stats.stop_reason,
+        )
         print(
             "[OK] run: "
             f"queue_done={result.queue_done}, "
@@ -902,7 +929,11 @@ def run_once() -> int:
             f"fullsync_next_offset={result.fullsync_next_offset}, "
             f"ingested_cards={result.ingested_cards}, "
             f"images_done={result.images_done}, "
-            f"api_calls={result.api_calls}"
+            f"api_calls={result.api_calls}, "
+            f"dict_processed_cards={dict_stats.processed_cards}, "
+            f"dict_new_phrases={dict_stats.new_phrases}, "
+            f"dict_updated_phrases={dict_stats.updated_phrases}, "
+            f"dict_stop_reason={dict_stats.stop_reason}"
         )
         return 0
 
