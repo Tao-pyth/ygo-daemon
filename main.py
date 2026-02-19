@@ -31,8 +31,9 @@ from requests.exceptions import RequestException
 
 from app.cli import dispatch
 from app.config import DB_PATH, load_app_config
-from app.dict_builder import DictBuilderConfig, run_incremental_build
+from app.usecase.dict_build import DictBuilderConfig, run_incremental_build
 from app.infra.migrate import apply_migrations
+from app.infra.table_dump import TableDumpError, dump_tables, parse_tables_arg, validate_tables
 from app.orchestrator import execute_run_cycle
 
 
@@ -97,11 +98,13 @@ def now_iso() -> str:
 
 
 def ensure_dirs() -> None:
+    """実行に必要なディレクトリを事前作成する。"""
     for p in [DATA_DIR, DB_DIR, LOCK_DIR, DICT_LOCK_DIR, STAGING_DIR, LOG_DIR, IMAGE_DIR, TEMP_IMAGE_DIR, FAILED_INGEST_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 
 def configure_logging() -> None:
+    """ファイルロガーを初期化する（重複登録防止あり）。"""
     ensure_dirs()
     if LOGGER.handlers:
         return
@@ -148,6 +151,7 @@ def sha256_text(s: str) -> str:
 
 
 def sleep_rate() -> None:
+    """API 呼び出し間隔を維持するため、基本待機 + ジッタで sleep する。"""
     base = RUN_INTERVAL_SLEEP_SEC
     jitter = random.uniform(-JITTER_SEC, JITTER_SEC)
     sec = max(0.0, base + jitter)
@@ -162,6 +166,7 @@ class ApiResult:
 
 
 def parse_cards_from_response(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """API レスポンスから card dict のみを安全に抽出する。"""
     data = raw.get("data")
     if not isinstance(data, list):
         return []
@@ -169,6 +174,8 @@ def parse_cards_from_response(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 class ApiClient:
+    """YGOPRODeck API 呼び出しを集約する薄いクライアント。"""
+
     def __init__(self) -> None:
         self.session = requests.Session()
         self.api_calls = 0
@@ -434,6 +441,7 @@ def queue_add(con: sqlite3.Connection, *, konami_id: Optional[int], keyword: Opt
 
 
 def queue_pick_next(con: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    """最も古い PENDING キューを 1 件取得する。"""
     return con.execute(
         "SELECT * FROM request_queue WHERE state='PENDING' ORDER BY id ASC LIMIT 1"
     ).fetchone()
@@ -457,6 +465,7 @@ def queue_mark_done(con: sqlite3.Connection, qid: int) -> None:
 
 
 def queue_mark_retry(con: sqlite3.Connection, qid: int, err: str) -> None:
+    """キュー失敗時に ERROR へ遷移し、attempts とエラー概要を記録する。"""
     con.execute(
         "UPDATE request_queue SET state='ERROR', attempts=attempts+1, last_error=? WHERE id=?",
         (err[:2000], qid),
@@ -473,6 +482,7 @@ def mark_need_fetch_by_konami_id(con: sqlite3.Connection, konami_id: int) -> Non
 
 
 def staging_write_cards(cards: List[Dict[str, Any]], source: str) -> Optional[Path]:
+    """カード配列を JSONL にそのまま書き出し、ingest 前の原本を残す。"""
     if not cards:
         return None
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1026,6 +1036,35 @@ def cmd_dict_build(max_runtime_sec: Optional[int], batch_size: Optional[int], dr
         con.close()
 
 
+def _cmd_dump(tables_text: Optional[str], out: str, fmt: str, *, use_default_tables: bool) -> int:
+    con = db_connect()
+    try:
+        ensure_schema(con)
+        default_tables = None if not use_default_tables else (
+            "dsl_dictionary_patterns",
+            "dsl_dictionary_terms",
+            "kv_store",
+        )
+        tables = parse_tables_arg(tables_text, default_tables=default_tables or ())
+        tables = validate_tables(con, tables)
+        exported = dump_tables(con, tables=tables, out_path=Path(out), fmt=fmt)
+        print(f"[OK] dump: tables={','.join(tables)} rows={exported} format={fmt} out={out}")
+        return 0
+    except TableDumpError as e:
+        print(f"[ERROR] {e}")
+        return 2
+    finally:
+        con.close()
+
+
+def cmd_dict_dump(tables_text: Optional[str], out: str, fmt: str) -> int:
+    return _cmd_dump(tables_text, out, fmt, use_default_tables=True)
+
+
+def cmd_db_dump(tables_text: Optional[str], out: str, fmt: str) -> int:
+    return _cmd_dump(tables_text, out, fmt, use_default_tables=False)
+
+
 def main(argv: List[str]) -> int:
     return dispatch(
         argv,
@@ -1033,6 +1072,8 @@ def main(argv: List[str]) -> int:
         cmd_queue_add=cmd_queue_add,
         cmd_run_once=run_once,
         cmd_dict_build=cmd_dict_build,
+        cmd_dict_dump=cmd_dict_dump,
+        cmd_db_dump=cmd_db_dump,
     )
 
 
