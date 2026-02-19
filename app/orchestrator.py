@@ -42,6 +42,7 @@ def execute_run_cycle(
     引き継ぎ時は、本関数の順序が運用ポリシー（queue優先・段階再取得）に
     直結している点を最優先で確認すること。
     """
+    # Step 1: DB バージョン差分を確認し、以降ステップが参照するハッシュを確定。
     dbver_hash = step_check_dbver(con, api)
 
     if kv_get(con, "dbver_changed", "0") == "1":
@@ -51,6 +52,7 @@ def execute_run_cycle(
         kv_set(con, "dbver_changed", "0")
         con.commit()
 
+    # Step 2: 前回失敗分を再挑戦可能状態へ戻してから、今回の queue 処理を開始。
     queue_requeue_errors(con)
 
     queue_done = step_consume_queue(con, api, dbver_hash)
@@ -59,14 +61,17 @@ def execute_run_cycle(
     fullsync_cards = 0
     fullsync_upserted = 0
     fullsync_next_offset = None
+    # Step 3: queue を優先しつつ、処理枠に余裕がある場合のみ fullsync を 1 ページ進める。
     if queue_done < max_queue_items_per_run or not has_pending_after_queue:
         fullsync_ran, fullsync_cards, fullsync_upserted, fullsync_next_offset = step_fullsync_once(con, api)
 
+    # Step 4: 取得済み JSONL を DB へ反映。ここで cards_raw のロスレス保存を行う。
     ingested_cards = step_ingest_sqlite(con, dbver_hash)
 
     kv_set(con, "last_run_at", now_iso())
     con.commit()
 
+    # Step 5: 末尾で画像取得を実施。同期本体より失敗影響を分離しやすくする。
     images_done = step_download_images(con, api)
 
     return RunResult(
