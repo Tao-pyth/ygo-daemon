@@ -77,6 +77,14 @@ IMAGE_DOWNLOAD_LIMIT_PER_RUN = APP_CONFIG.image_download_limit_per_run
 DICT_BUILDER_MAX_RUNTIME_SEC = APP_CONFIG.dict_builder_max_runtime_sec
 DICT_BUILDER_BATCH_SIZE = APP_CONFIG.dict_builder_batch_size
 DICT_RULESET_VERSION = APP_CONFIG.dict_ruleset_version
+DICT_ACCEPT_THRESHOLDS = {
+    "cost_patterns": APP_CONFIG.dict_accept_threshold_cost,
+    "action_patterns": APP_CONFIG.dict_accept_threshold_action,
+    "trigger_patterns": APP_CONFIG.dict_accept_threshold_trigger,
+    "restriction_patterns": APP_CONFIG.dict_accept_threshold_restriction,
+    "condition_patterns": APP_CONFIG.dict_accept_threshold_condition,
+    "unclassified_patterns": APP_CONFIG.dict_accept_threshold_unclassified,
+}
 
 LOGGER = logging.getLogger("ygo-daemon")
 
@@ -888,18 +896,6 @@ def run_once() -> int:
             now_iso=now_iso,
         )
 
-        dict_stats = run_incremental_build(
-            con,
-            DictBuilderConfig(
-                lock_path=DICT_LOCK_PATH,
-                log_path=DICT_LOG_PATH,
-                log_level=DICT_LOG_LEVEL,
-                max_runtime_sec=DICT_BUILDER_MAX_RUNTIME_SEC,
-                batch_size=DICT_BUILDER_BATCH_SIZE,
-                ruleset_version=DICT_RULESET_VERSION,
-            ),
-        )
-
         elapsed = time.monotonic() - started
         LOGGER.info(
             "run_finish elapsed_sec=%.3f queue_done=%s fullsync_ran=%s fullsync_cards=%s fullsync_upserted=%s fullsync_next_offset=%s ingested_cards=%s images_done=%s api_calls=%s",
@@ -913,13 +909,6 @@ def run_once() -> int:
             result.images_done,
             result.api_calls,
         )
-        LOGGER.info(
-            "dict_build_summary processed_cards=%s new_phrases=%s updated_phrases=%s stop_reason=%s",
-            dict_stats.processed_cards,
-            dict_stats.new_phrases,
-            dict_stats.updated_phrases,
-            dict_stats.stop_reason,
-        )
         print(
             "[OK] run: "
             f"queue_done={result.queue_done}, "
@@ -929,11 +918,7 @@ def run_once() -> int:
             f"fullsync_next_offset={result.fullsync_next_offset}, "
             f"ingested_cards={result.ingested_cards}, "
             f"images_done={result.images_done}, "
-            f"api_calls={result.api_calls}, "
-            f"dict_processed_cards={dict_stats.processed_cards}, "
-            f"dict_new_phrases={dict_stats.new_phrases}, "
-            f"dict_updated_phrases={dict_stats.updated_phrases}, "
-            f"dict_stop_reason={dict_stats.stop_reason}"
+            f"api_calls={result.api_calls}"
         )
         return 0
 
@@ -978,12 +963,60 @@ def cmd_queue_add(konami_id: Optional[int], keyword: Optional[str]) -> int:
         con.close()
 
 
+def cmd_dict_build(max_runtime_sec: Optional[int], batch_size: Optional[int], dry_run: bool, log_level: Optional[str]) -> int:
+    configure_logging()
+    con = db_connect()
+    try:
+        ensure_schema(con)
+        stats = run_incremental_build(
+            con,
+            DictBuilderConfig(
+                lock_path=DICT_LOCK_PATH,
+                log_path=DICT_LOG_PATH,
+                log_level=(log_level or DICT_LOG_LEVEL).upper(),
+                max_runtime_sec=max_runtime_sec if max_runtime_sec is not None else DICT_BUILDER_MAX_RUNTIME_SEC,
+                batch_size=batch_size if batch_size is not None else DICT_BUILDER_BATCH_SIZE,
+                ruleset_version=DICT_RULESET_VERSION,
+                dry_run=dry_run,
+                accept_thresholds=DICT_ACCEPT_THRESHOLDS,
+            ),
+        )
+        LOGGER.info(
+            "dict_build_summary processed_cards=%s new_phrases=%s updated_phrases=%s promoted_phrases=%s rejected_phrases=%s stop_reason=%s",
+            stats.processed_cards,
+            stats.new_phrases,
+            stats.updated_phrases,
+            stats.promoted_phrases,
+            stats.rejected_phrases,
+            stats.stop_reason,
+        )
+        if stats.stop_reason == "exception":
+            return 1
+        print(
+            "[OK] dict-build: "
+            f"processed_cards={stats.processed_cards}, "
+            f"new_phrases={stats.new_phrases}, "
+            f"updated_phrases={stats.updated_phrases}, "
+            f"promoted_phrases={stats.promoted_phrases}, "
+            f"rejected_phrases={stats.rejected_phrases}, "
+            f"stop_reason={stats.stop_reason}"
+        )
+        return 0
+    except Exception as e:
+        LOGGER.error("dict-build failed: %s", e, exc_info=LOG_LEVEL == "DEBUG")
+        print(f"[ERROR] {e}")
+        return 1
+    finally:
+        con.close()
+
+
 def main(argv: List[str]) -> int:
     return dispatch(
         argv,
         cmd_initdb=cmd_initdb,
         cmd_queue_add=cmd_queue_add,
         cmd_run_once=run_once,
+        cmd_dict_build=cmd_dict_build,
     )
 
 
