@@ -10,8 +10,8 @@ REM 1) リポジトリ直下へ移動（scripts の1階層上）
 pushd "%~dp0.."
 
 REM 2) venv が存在すれば有効化
-if exist ".venv\Scripts\activate.bat" (
-  call ".venv\Scripts\activate.bat" >nul 2>&1
+if exist ".venv\Scripts\activate" (
+  call ".venv\Scripts\activate" >nul 2>&1
   if errorlevel 1 (
     echo [ERROR] venv activate failed.
     popd
