@@ -11,6 +11,7 @@ QueueAddHandler = Callable[[int | None, str | None], int]
 DictBuildHandler = Callable[[int | None, int | None, bool, str | None], int]
 DumpHandler = Callable[[str | None, str, str], int]
 DictSetLatestRulesetHandler = Callable[[int], int]
+StatusHandler = Callable[[], int]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_dump.add_argument("--tables", type=str, required=True, help="カンマ区切りテーブル名")
     p_db_dump.add_argument("--out", type=str, required=True, help="出力ファイルパス")
     p_db_dump.add_argument("--format", choices=["jsonl", "csv"], default="jsonl")
+    sub.add_parser("status", help="実行状況・最新ログ情報を表示")
     return parser
 
 
@@ -81,6 +83,7 @@ def dispatch(
     cmd_dict_dump: DumpHandler,
     cmd_db_dump: DumpHandler,
     cmd_dict_set_latest_ruleset: DictSetLatestRulesetHandler,
+    cmd_status: StatusHandler,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -99,4 +102,6 @@ def dispatch(
         return cmd_db_dump(args.tables, args.out, args.format)
     if args.cmd == "dict-set-latest-ruleset":
         return cmd_dict_set_latest_ruleset(args.ruleset_id)
+    if args.cmd == "status":
+        return cmd_status()
     return 2

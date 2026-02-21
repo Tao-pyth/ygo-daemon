@@ -291,3 +291,31 @@ def test_cmd_dict_set_latest_ruleset_updates_kv(temp_db: sqlite3.Connection) -> 
     row = temp_db.execute("SELECT value FROM kv_store WHERE key='dict_build:latest_ruleset_id'").fetchone()
     assert row is not None
     assert row["value"] == "4"
+
+
+def test_extract_cmd_header() -> None:
+    line = "2026-01-01 [INFO] CMD=dict-build RUN_ID=20260101_000000 DB=data/db/ygo.sqlite"
+    assert main.extract_cmd_header(line) == "CMD=dict-build"
+
+
+def test_get_latest_log_file(tmp_path: Path) -> None:
+    a = tmp_path / "logs" / "run.log"
+    b = tmp_path / "logs" / "dict.log"
+    a.parent.mkdir(parents=True, exist_ok=True)
+    a.write_text("a", encoding="utf-8")
+    b.write_text("b", encoding="utf-8")
+    import os
+    os.utime(b, (a.stat().st_atime + 10, a.stat().st_mtime + 10))
+    assert main.get_latest_log_file(tmp_path / "logs") == b
+
+
+def test_cli_status_calls_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = {"ok": False}
+
+    def fake_status() -> int:
+        called["ok"] = True
+        return 0
+
+    monkeypatch.setattr(main, "cmd_status", fake_status)
+    assert main.main(["status"]) == 0
+    assert called["ok"]

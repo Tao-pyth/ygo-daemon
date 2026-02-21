@@ -19,9 +19,10 @@ import random
 import sqlite3
 import sys
 import time
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
+from logging import FileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,7 +35,7 @@ from app.config import DB_PATH, load_app_config
 from app.usecase.dict_build import DictBuilderConfig, run_incremental_build
 from app.infra.migrate import apply_migrations
 from app.infra.table_dump import TableDumpError, dump_tables, parse_tables_arg, validate_tables
-from app.infra.repo_dict import get_ruleset_metrics, set_latest_ruleset_id
+from app.infra.repo_dict import get_latest_ruleset_id, set_latest_ruleset_id
 from app.orchestrator import execute_run_cycle
 
 
@@ -72,7 +73,7 @@ DB_DIR = DATA_DIR / "db"
 
 LOCK_PATH = LOCK_DIR / "daemon.lock"
 DICT_LOCK_PATH = DICT_LOCK_DIR / "dict_builder.lock"
-DICT_LOG_PATH = LOG_DIR / "dict_builder.log"
+DICT_LOG_PATH = LOG_DIR / "dict-build" / "latest.log"
 LOG_LEVEL = os.getenv("YGO_LOG_LEVEL", APP_CONFIG.log_level).upper()
 DICT_LOG_LEVEL = os.getenv("YGO_DICT_LOG_LEVEL", APP_CONFIG.log_level).upper()
 IMAGE_DOWNLOAD_LIMIT_PER_RUN = APP_CONFIG.image_download_limit_per_run
@@ -104,22 +105,59 @@ def ensure_dirs() -> None:
         p.mkdir(parents=True, exist_ok=True)
 
 
-def configure_logging() -> None:
-    """ファイルロガーを初期化する（重複登録防止あり）。"""
-    ensure_dirs()
-    if LOGGER.handlers:
-        return
+def build_run_id() -> str:
+    return datetime.now(timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
 
-    LOGGER.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-    handler = RotatingFileHandler(
-        LOG_DIR / "daemon.log",
-        maxBytes=1_000_000,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+def build_log_paths(command: str, run_id: str) -> tuple[Path, Path]:
+    day = run_id.split("_", maxsplit=1)[0]
+    command_dir = LOG_DIR / command
+    return (command_dir / day / f"{command}_{run_id}.log", command_dir / "latest.log")
+
+
+def configure_logging(command: str, run_id: str, level: str) -> tuple[Path, Path]:
+    """実行単位ログを初期化し、同一プロセス内の重複ハンドラを除去する。"""
+    ensure_dirs()
+    log_path, latest_path = build_log_paths(command, run_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for handler in list(LOGGER.handlers):
+        LOGGER.removeHandler(handler)
+        handler.close()
+
+    LOGGER.setLevel(getattr(logging, level.upper(), logging.INFO))
+    handler = FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(getattr(logging, level.upper(), logging.INFO))
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     LOGGER.addHandler(handler)
+    return log_path, latest_path
+
+
+def update_latest_log(log_path: Path, latest_path: Path) -> None:
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(log_path, latest_path)
+
+
+def get_latest_log_file(log_root: Path) -> Optional[Path]:
+    candidates = [p for p in log_root.rglob("*.log") if p.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def extract_cmd_header(line: str) -> str:
+    for token in line.strip().split():
+        if token.startswith("CMD="):
+            return token
+    return ""
+
+
+def emit_command_header(logger: logging.Logger, *, command: str, run_id: str, db_path: Path, ruleset_id: Optional[int]) -> None:
+    message = f"CMD={command} RUN_ID={run_id} DB={db_path}"
+    if ruleset_id is not None:
+        message += f" RULESET={ruleset_id}"
+    message += f" START={now_iso()}"
+    logger.info(message)
 
 
 def acquire_lock() -> bool:
@@ -886,8 +924,10 @@ def step_ingest_sqlite(con: sqlite3.Connection, dbver_hash: str) -> int:
 # =========================
 def run_once() -> int:
     """デーモン1サイクル実行。失敗時もロック解放だけは必ず行う。"""
-    configure_logging()
+    run_id = build_run_id()
+    log_path, latest_path = configure_logging("run", run_id, LOG_LEVEL)
     started = time.monotonic()
+    emit_command_header(LOGGER, command="run", run_id=run_id, db_path=DB_PATH, ruleset_id=None)
     LOGGER.info(
         "run_start command=run db_path=%s max_queue_items=%s image_limit=%s",
         DB_PATH,
@@ -959,27 +999,37 @@ def run_once() -> int:
                 con.close()
         finally:
             release_lock()
+            update_latest_log(log_path, latest_path)
 
 
 # =========================
 # CLI
 # =========================
 def cmd_initdb() -> int:
+    run_id = build_run_id()
+    log_path, latest_path = configure_logging("initdb", run_id, LOG_LEVEL)
     ensure_dirs()
     con = db_connect()
     try:
+        emit_command_header(LOGGER, command="initdb", run_id=run_id, db_path=DB_PATH, ruleset_id=None)
         ensure_schema(con)
+        LOGGER.info("initdb_done db_path=%s", DB_PATH)
         print(f"[OK] DB initialized: {DB_PATH}")
         return 0
     finally:
         con.close()
+        update_latest_log(log_path, latest_path)
 
 
 def cmd_queue_add(konami_id: Optional[int], keyword: Optional[str]) -> int:
+    run_id = build_run_id()
+    log_path, latest_path = configure_logging("queue-add", run_id, LOG_LEVEL)
     con = db_connect()
     try:
+        emit_command_header(LOGGER, command="queue-add", run_id=run_id, db_path=DB_PATH, ruleset_id=None)
         ensure_schema(con)
         queue_add(con, konami_id=konami_id, keyword=keyword)
+        LOGGER.info("queue_add_done konami_id=%s keyword=%s", konami_id, keyword)
         if konami_id is not None:
             print(f"[OK] queued konami_id={konami_id}")
         else:
@@ -987,44 +1037,34 @@ def cmd_queue_add(konami_id: Optional[int], keyword: Optional[str]) -> int:
         return 0
     finally:
         con.close()
+        update_latest_log(log_path, latest_path)
 
 
 def cmd_dict_build(max_runtime_sec: Optional[int], batch_size: Optional[int], dry_run: bool, log_level: Optional[str]) -> int:
     """辞書増分構築コマンド。実処理は run_incremental_build に委譲する。"""
-    configure_logging()
+    run_id = build_run_id()
+    dict_log_level = (log_level or DICT_LOG_LEVEL).upper()
+    log_path, latest_path = build_log_paths("dict-build", run_id)
     con = db_connect()
     try:
         ensure_schema(con)
+        latest_ruleset_id = get_latest_ruleset_id(con)
         stats = run_incremental_build(
             con,
             DictBuilderConfig(
                 lock_path=DICT_LOCK_PATH,
-                log_path=DICT_LOG_PATH,
-                log_level=(log_level or DICT_LOG_LEVEL).upper(),
+                log_path=log_path,
+                log_level=dict_log_level,
                 max_runtime_sec=max_runtime_sec if max_runtime_sec is not None else DICT_BUILDER_MAX_RUNTIME_SEC,
                 batch_size=batch_size if batch_size is not None else DICT_BUILDER_BATCH_SIZE,
                 ruleset_version=DICT_RULESET_VERSION,
                 dry_run=dry_run,
                 accept_thresholds=DICT_ACCEPT_THRESHOLDS,
+                run_id=run_id,
+                db_path=DB_PATH,
+                latest_ruleset_id=latest_ruleset_id,
             ),
         )
-        LOGGER.info(
-            "dict_build_summary processed_cards=%s new_phrases=%s updated_phrases=%s promoted_phrases=%s rejected_phrases=%s stop_reason=%s",
-            stats.processed_cards,
-            stats.new_phrases,
-            stats.updated_phrases,
-            stats.promoted_phrases,
-            stats.rejected_phrases,
-            stats.stop_reason,
-        )
-        for metric in get_ruleset_metrics(con):
-            LOGGER.info(
-                "dict_metrics ruleset_id=%s total_rows=%s count_eq_1_ratio=%.3f short_ratio=%.3f",
-                metric["ruleset_id"],
-                metric["total_rows"],
-                metric["count_eq_1_ratio"],
-                metric["short_ratio"],
-            )
         if stats.stop_reason == "exception":
             return 1
         print(
@@ -1038,33 +1078,42 @@ def cmd_dict_build(max_runtime_sec: Optional[int], batch_size: Optional[int], dr
         )
         return 0
     except Exception as e:
-        LOGGER.error("dict-build failed: %s", e, exc_info=LOG_LEVEL == "DEBUG")
         print(f"[ERROR] {e}")
         return 1
     finally:
         con.close()
+        update_latest_log(log_path, latest_path)
 
 
 
 
 def cmd_dict_set_latest_ruleset(ruleset_id: int) -> int:
+    run_id = build_run_id()
+    log_path, latest_path = configure_logging("dict-set-latest-ruleset", run_id, LOG_LEVEL)
     if ruleset_id < 1:
         print("[ERROR] --id must be >= 1")
         return 2
 
     con = db_connect()
     try:
+        emit_command_header(LOGGER, command="dict-set-latest-ruleset", run_id=run_id, db_path=DB_PATH, ruleset_id=None)
         ensure_schema(con)
         set_latest_ruleset_id(con, ruleset_id)
         con.commit()
+        LOGGER.info("dict_set_latest_ruleset_done ruleset_id=%s", ruleset_id)
         print(f"[OK] dict-build latest ruleset updated: {ruleset_id}")
         return 0
     finally:
         con.close()
+        update_latest_log(log_path, latest_path)
 
 def _cmd_dump(tables_text: Optional[str], out: str, fmt: str, *, use_default_tables: bool) -> int:
+    command = "dict-dump" if use_default_tables else "db-dump"
+    run_id = build_run_id()
+    log_path, latest_path = configure_logging(command, run_id, LOG_LEVEL)
     con = db_connect()
     try:
+        emit_command_header(LOGGER, command=command, run_id=run_id, db_path=DB_PATH, ruleset_id=None)
         ensure_schema(con)
         default_tables = None if not use_default_tables else (
             "dsl_dictionary_patterns",
@@ -1074,6 +1123,7 @@ def _cmd_dump(tables_text: Optional[str], out: str, fmt: str, *, use_default_tab
         tables = parse_tables_arg(tables_text, default_tables=default_tables or ())
         tables = validate_tables(con, tables)
         exported = dump_tables(con, tables=tables, out_path=Path(out), fmt=fmt)
+        LOGGER.info("dump_done command=%s tables=%s rows=%s format=%s out=%s", command, ",".join(tables), exported, fmt, out)
         print(f"[OK] dump: tables={','.join(tables)} rows={exported} format={fmt} out={out}")
         return 0
     except TableDumpError as e:
@@ -1081,6 +1131,20 @@ def _cmd_dump(tables_text: Optional[str], out: str, fmt: str, *, use_default_tab
         return 2
     finally:
         con.close()
+        update_latest_log(log_path, latest_path)
+
+
+def cmd_status() -> int:
+    latest_any = get_latest_log_file(LOG_DIR)
+    latest_any_cmd = ""
+    if latest_any is not None:
+        with latest_any.open("r", encoding="utf-8") as f:
+            latest_any_cmd = extract_cmd_header(f.readline())
+
+    print("[LOGS]")
+    print(f"latest_any: {latest_any.resolve() if latest_any is not None else '(none)'}")
+    print(f"latest_any_cmd: {latest_any_cmd or '(unknown)'}")
+    return 0
 
 
 def cmd_dict_dump(tables_text: Optional[str], out: str, fmt: str) -> int:
@@ -1101,6 +1165,7 @@ def main(argv: List[str]) -> int:
         cmd_dict_dump=cmd_dict_dump,
         cmd_db_dump=cmd_db_dump,
         cmd_dict_set_latest_ruleset=cmd_dict_set_latest_ruleset,
+        cmd_status=cmd_status,
     )
 
 

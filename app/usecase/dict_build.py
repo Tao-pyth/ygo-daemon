@@ -42,6 +42,9 @@ class DictBuilderConfig:
     ruleset_version: str
     dry_run: bool = False
     accept_thresholds: dict[str, int] = field(default_factory=dict)
+    run_id: str = ""
+    db_path: Path = Path("")
+    latest_ruleset_id: int | None = None
 
 
 def _extract_card_payload(raw_json: str) -> tuple[list[str], set[str], set[str]]:
@@ -71,7 +74,14 @@ def _extract_vocab_terms(value: Any) -> set[str]:
 def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> DictBuildStats:
     logger = configure_logger(config.log_path, config.log_level)
     started = time.monotonic()
-    latest_ruleset_id = get_latest_ruleset_id(con)
+    latest_ruleset_id = config.latest_ruleset_id if config.latest_ruleset_id is not None else get_latest_ruleset_id(con)
+    logger.info(
+        "CMD=dict-build RUN_ID=%s DB=%s RULESET=%s START=%s",
+        config.run_id,
+        config.db_path,
+        latest_ruleset_id,
+        now_iso(),
+    )
     logger.info(
         "dict_build_start max_runtime_sec=%s batch_size=%s dry_run=%s latest_ruleset_id=%s",
         config.max_runtime_sec,
