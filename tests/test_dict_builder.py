@@ -55,6 +55,27 @@ def test_dict_builder_incremental_only(temp_db: sqlite3.Connection, tmp_path: Pa
     assert third.new_phrases >= 1
 
 
+
+
+def test_dict_builder_reprocesses_when_latest_ruleset_changes(temp_db: sqlite3.Connection, tmp_path: Path) -> None:
+    _insert_card(temp_db, 500, "2026-01-01T00:00:05+00:00", "Draw 1 card.")
+
+    first = run_incremental_build(temp_db, _config(tmp_path))
+    assert first.processed_cards == 1
+
+    temp_db.execute(
+        "INSERT INTO kv_store(key, value) VALUES('dict_build:latest_ruleset_id', '3') ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+    temp_db.commit()
+
+    second = run_incremental_build(temp_db, _config(tmp_path))
+    assert second.processed_cards == 1
+
+    processed = temp_db.execute(
+        "SELECT COUNT(*) AS c FROM dict_build_processed_cards WHERE card_id=500"
+    ).fetchone()
+    assert processed["c"] == 2
+
 def test_dict_builder_lock_skip(temp_db: sqlite3.Connection, tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     cfg.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +91,7 @@ def test_unclassified_saved(temp_db: sqlite3.Connection, tmp_path: Path) -> None
     run_incremental_build(temp_db, _config(tmp_path))
 
     row = temp_db.execute(
-        "SELECT count FROM dsl_dictionary_patterns WHERE category='unclassified_patterns'"
+        "SELECT count FROM dsl_dictionary_patterns WHERE ruleset_id=2 AND category='unclassified_patterns'"
     ).fetchone()
     assert row is not None
 
@@ -81,7 +102,7 @@ def test_candidate_promoted_to_accepted(temp_db: sqlite3.Connection, tmp_path: P
     run_incremental_build(temp_db, _config(tmp_path))
 
     row = temp_db.execute(
-        "SELECT status FROM dsl_dictionary_patterns WHERE category='action_patterns' AND template='draw {N} {TARGET_CARD}.'"
+        "SELECT status FROM dsl_dictionary_patterns WHERE ruleset_id=2 AND category='action_patterns' AND template='draw {N} {TARGET_CARD}.'"
     ).fetchone()
     assert row is not None
     assert row["status"] == "accepted"

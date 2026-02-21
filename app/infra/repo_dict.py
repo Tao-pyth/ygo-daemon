@@ -5,46 +5,85 @@ import sqlite3
 from app.service.dict_promote import apply_status_rules
 
 
-def iter_target_cards(con: sqlite3.Connection, *, fetched_at: str, card_id: int, batch_size: int) -> list[sqlite3.Row]:
+LATEST_RULESET_KEY = "dict_build:latest_ruleset_id"
+
+
+def get_latest_ruleset_id(con: sqlite3.Connection) -> int:
+    row = con.execute("SELECT value FROM kv_store WHERE key=?", (LATEST_RULESET_KEY,)).fetchone()
+    if row is None:
+        return 2
+    try:
+        value = int(row["value"])
+    except (TypeError, ValueError):
+        return 2
+    return max(value, 1)
+
+
+def set_latest_ruleset_id(con: sqlite3.Connection, ruleset_id: int) -> None:
+    con.execute(
+        "INSERT INTO kv_store(key,value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (LATEST_RULESET_KEY, str(ruleset_id)),
+    )
+
+
+def iter_target_cards(con: sqlite3.Connection, *, ruleset_id: int, batch_size: int) -> list[sqlite3.Row]:
     return list(
         con.execute(
             """
-            SELECT card_id, fetched_at, json
-            FROM cards_raw
-            WHERE fetched_at > ? OR (fetched_at = ? AND card_id > ?)
-            ORDER BY fetched_at ASC, card_id ASC
+            SELECT c.card_id, c.fetched_at, c.json
+            FROM cards_raw AS c
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM dict_build_processed_cards AS p
+              WHERE p.card_id = c.card_id AND p.ruleset_id = ?
+            )
+            ORDER BY c.fetched_at ASC, c.card_id ASC
             LIMIT ?
             """,
-            (fetched_at, fetched_at, card_id, batch_size),
+            (ruleset_id, batch_size),
         ).fetchall()
+    )
+
+
+def mark_card_processed(con: sqlite3.Connection, *, card_id: int, ruleset_id: int, processed_at: str) -> None:
+    con.execute(
+        """
+        INSERT INTO dict_build_processed_cards(card_id, ruleset_id, processed_at)
+        VALUES(?,?,?)
+        ON CONFLICT(card_id, ruleset_id)
+        DO UPDATE SET processed_at=excluded.processed_at
+        """,
+        (card_id, ruleset_id, processed_at),
     )
 
 
 def upsert_phrase(
     con: sqlite3.Connection,
     *,
+    ruleset_id: int,
     category: str,
     template: str,
     ruleset_version: str,
     captured_at: str,
 ) -> bool:
     exists = con.execute(
-        "SELECT 1 FROM dsl_dictionary_patterns WHERE category=? AND template=? AND dict_ruleset_version=?",
-        (category, template, ruleset_version),
+        "SELECT 1 FROM dsl_dictionary_patterns WHERE ruleset_id=? AND template=?",
+        (ruleset_id, template),
     ).fetchone()
     con.execute(
         """
         INSERT INTO dsl_dictionary_patterns(
-          category, template, count, status, dict_ruleset_version, first_seen_at, last_seen_at, updated_at
+          ruleset_id, category, template, count, status, dict_ruleset_version, first_seen_at, last_seen_at, updated_at
         )
-        VALUES(?,?,?,?,?,?,?,?)
-        ON CONFLICT(category, template, dict_ruleset_version)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(ruleset_id, template)
         DO UPDATE SET
           count=dsl_dictionary_patterns.count+1,
+          category=excluded.category,
           last_seen_at=excluded.last_seen_at,
           updated_at=excluded.updated_at
         """,
-        (category, template, 1, "candidate", ruleset_version, captured_at, captured_at, captured_at),
+        (ruleset_id, category, template, 1, "candidate", ruleset_version, captured_at, captured_at, captured_at),
     )
     return exists is None
 
@@ -52,6 +91,7 @@ def upsert_phrase(
 def upsert_term(
     con: sqlite3.Connection,
     *,
+    ruleset_id: int,
     term_type: str,
     normalized_term: str,
     placeholder: str,
@@ -61,22 +101,23 @@ def upsert_term(
     con.execute(
         """
         INSERT INTO dsl_dictionary_terms(
-          term_type, normalized_term, placeholder, count, status, dict_ruleset_version, first_seen_at, last_seen_at, updated_at
+          ruleset_id, term_type, normalized_term, placeholder, count, status, dict_ruleset_version, first_seen_at, last_seen_at, updated_at
         )
-        VALUES(?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(term_type, normalized_term, dict_ruleset_version)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(ruleset_id, term_type, normalized_term)
         DO UPDATE SET
           count=dsl_dictionary_terms.count+1,
           last_seen_at=excluded.last_seen_at,
           updated_at=excluded.updated_at
         """,
-        (term_type, normalized_term, placeholder, 1, "candidate", ruleset_version, captured_at, captured_at, captured_at),
+        (ruleset_id, term_type, normalized_term, placeholder, 1, "candidate", ruleset_version, captured_at, captured_at, captured_at),
     )
 
 
 def apply_phrase_status_rules(
     con: sqlite3.Connection,
     *,
+    ruleset_id: int,
     category: str,
     template: str,
     ruleset_version: str,
@@ -84,8 +125,8 @@ def apply_phrase_status_rules(
     captured_at: str,
 ) -> tuple[bool, bool]:
     row = con.execute(
-        "SELECT count, status FROM dsl_dictionary_patterns WHERE category=? AND template=? AND dict_ruleset_version=?",
-        (category, template, ruleset_version),
+        "SELECT count, status FROM dsl_dictionary_patterns WHERE ruleset_id=? AND template=?",
+        (ruleset_id, template),
     ).fetchone()
     if row is None:
         return (False, False)
@@ -103,30 +144,7 @@ def apply_phrase_status_rules(
         return (False, False)
 
     con.execute(
-        "UPDATE dsl_dictionary_patterns SET status=?, updated_at=? WHERE category=? AND template=? AND dict_ruleset_version=?",
-        (next_status, captured_at, category, template, ruleset_version),
+        "UPDATE dsl_dictionary_patterns SET status=?, updated_at=? WHERE ruleset_id=? AND template=?",
+        (next_status, captured_at, ruleset_id, template),
     )
     return (next_status == "accepted", next_status == "rejected")
-
-
-def load_dict_progress(con: sqlite3.Connection) -> tuple[str, int]:
-    last_fetched_at = (
-        con.execute("SELECT value FROM kv_store WHERE key='dict_builder_last_fetched_at'").fetchone() or {"value": ""}
-    )["value"]
-    last_card_id_text = (con.execute("SELECT value FROM kv_store WHERE key='dict_builder_last_card_id'").fetchone() or {"value": "0"})[
-        "value"
-    ]
-    if not last_fetched_at:
-        last_fetched_at = "1970-01-01T00:00:00+00:00"
-    return str(last_fetched_at or ""), int(last_card_id_text or 0)
-
-
-def save_dict_progress(con: sqlite3.Connection, *, last_fetched_at: str, last_card_id: int) -> None:
-    con.execute(
-        "INSERT INTO kv_store(key,value) VALUES('dict_builder_last_fetched_at', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (last_fetched_at,),
-    )
-    con.execute(
-        "INSERT INTO kv_store(key,value) VALUES('dict_builder_last_card_id', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(last_card_id),),
-    )

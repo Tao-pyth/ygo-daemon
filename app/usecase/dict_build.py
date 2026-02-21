@@ -10,9 +10,9 @@ from app.infra.lockfile import acquire_lock, now_iso, release_lock
 from app.infra.loggers import configure_logger
 from app.infra.repo_dict import (
     apply_phrase_status_rules,
+    get_latest_ruleset_id,
     iter_target_cards,
-    load_dict_progress,
-    save_dict_progress,
+    mark_card_processed,
     upsert_phrase,
     upsert_term,
 )
@@ -59,11 +59,13 @@ def _extract_card_sentences(raw_json: str) -> list[str]:
 def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> DictBuildStats:
     logger = configure_logger(config.log_path, config.log_level)
     started = time.monotonic()
+    latest_ruleset_id = get_latest_ruleset_id(con)
     logger.info(
-        "dict_build_start max_runtime_sec=%s batch_size=%s dry_run=%s",
+        "dict_build_start max_runtime_sec=%s batch_size=%s dry_run=%s latest_ruleset_id=%s",
         config.max_runtime_sec,
         config.batch_size,
         config.dry_run,
+        latest_ruleset_id,
     )
 
     if not acquire_lock(config.lock_path):
@@ -79,15 +81,13 @@ def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> Di
     category_stats: dict[str, dict[str, int]] = {}
 
     try:
-        last_fetched_at, last_card_id = load_dict_progress(con)
-
         while True:
             elapsed = time.monotonic() - started
             if elapsed >= config.max_runtime_sec:
                 stop_reason = "max_runtime_reached"
                 break
 
-            rows = iter_target_cards(con, fetched_at=last_fetched_at, card_id=last_card_id, batch_size=config.batch_size)
+            rows = iter_target_cards(con, ruleset_id=latest_ruleset_id, batch_size=config.batch_size)
             if not rows:
                 break
 
@@ -101,6 +101,7 @@ def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> Di
 
                     is_new = upsert_phrase(
                         con,
+                        ruleset_id=latest_ruleset_id,
                         category=category,
                         template=template,
                         ruleset_version=config.ruleset_version,
@@ -115,6 +116,7 @@ def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> Di
 
                     promoted, rejected = apply_phrase_status_rules(
                         con,
+                        ruleset_id=latest_ruleset_id,
                         category=category,
                         template=template,
                         ruleset_version=config.ruleset_version,
@@ -134,6 +136,7 @@ def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> Di
                         if placeholder in template:
                             upsert_term(
                                 con,
+                                ruleset_id=latest_ruleset_id,
                                 term_type="zone_dictionary",
                                 normalized_term=zone,
                                 placeholder=placeholder,
@@ -144,6 +147,7 @@ def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> Di
                         if placeholder in template:
                             upsert_term(
                                 con,
+                                ruleset_id=latest_ruleset_id,
                                 term_type="target_dictionary",
                                 normalized_term=target,
                                 placeholder=placeholder,
@@ -151,11 +155,14 @@ def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> Di
                                 captured_at=captured_at,
                             )
 
+                mark_card_processed(
+                    con,
+                    card_id=int(row["card_id"]),
+                    ruleset_id=latest_ruleset_id,
+                    processed_at=captured_at,
+                )
                 processed_cards += 1
-                last_fetched_at = str(row["fetched_at"])
-                last_card_id = int(row["card_id"])
 
-            save_dict_progress(con, last_fetched_at=last_fetched_at, last_card_id=last_card_id)
             if config.dry_run:
                 con.rollback()
             else:

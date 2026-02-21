@@ -34,6 +34,7 @@ from app.config import DB_PATH, load_app_config
 from app.usecase.dict_build import DictBuilderConfig, run_incremental_build
 from app.infra.migrate import apply_migrations
 from app.infra.table_dump import TableDumpError, dump_tables, parse_tables_arg, validate_tables
+from app.infra.repo_dict import set_latest_ruleset_id
 from app.orchestrator import execute_run_cycle
 
 
@@ -1036,6 +1037,23 @@ def cmd_dict_build(max_runtime_sec: Optional[int], batch_size: Optional[int], dr
         con.close()
 
 
+
+
+def cmd_dict_set_latest_ruleset(ruleset_id: int) -> int:
+    if ruleset_id < 1:
+        print("[ERROR] --id must be >= 1")
+        return 2
+
+    con = db_connect()
+    try:
+        ensure_schema(con)
+        set_latest_ruleset_id(con, ruleset_id)
+        con.commit()
+        print(f"[OK] dict-build latest ruleset updated: {ruleset_id}")
+        return 0
+    finally:
+        con.close()
+
 def _cmd_dump(tables_text: Optional[str], out: str, fmt: str, *, use_default_tables: bool) -> int:
     con = db_connect()
     try:
@@ -1074,6 +1092,7 @@ def main(argv: List[str]) -> int:
         cmd_dict_build=cmd_dict_build,
         cmd_dict_dump=cmd_dict_dump,
         cmd_db_dump=cmd_db_dump,
+        cmd_dict_set_latest_ruleset=cmd_dict_set_latest_ruleset,
     )
 
 
