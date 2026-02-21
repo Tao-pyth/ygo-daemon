@@ -267,3 +267,27 @@ def test_cmd_db_dump_rejects_cards_raw(temp_db: sqlite3.Connection, tmp_path: Pa
     code = main.cmd_db_dump("cards_raw", str(out), "jsonl")
 
     assert code == 2
+
+
+def test_cli_dict_set_latest_ruleset_forwards_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_cmd(ruleset_id: int) -> int:
+        captured["ruleset_id"] = ruleset_id
+        return 0
+
+    monkeypatch.setattr(main, "cmd_dict_set_latest_ruleset", fake_cmd)
+
+    code = main.main(["dict-set-latest-ruleset", "--id", "3"])
+
+    assert code == 0
+    assert captured == {"ruleset_id": 3}
+
+
+def test_cmd_dict_set_latest_ruleset_updates_kv(temp_db: sqlite3.Connection) -> None:
+    code = main.cmd_dict_set_latest_ruleset(4)
+
+    assert code == 0
+    row = temp_db.execute("SELECT value FROM kv_store WHERE key='dict_build:latest_ruleset_id'").fetchone()
+    assert row is not None
+    assert row["value"] == "4"
