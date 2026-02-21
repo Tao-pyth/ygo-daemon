@@ -15,5 +15,5 @@ from app.service.dict_classify import (  # noqa: F401
     PatternRule,
     detect_category,
 )
-from app.service.dict_text import TARGETS, ZONES, normalize_template, split_sentences  # noqa: F401
+from app.service.dict_text import TARGETS, normalize_template, split_sentences  # noqa: F401
 from app.usecase.dict_build import DictBuildStats, DictBuilderConfig, execute_dict_build, run_incremental_build  # noqa: F401

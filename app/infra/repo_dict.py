@@ -148,3 +148,72 @@ def apply_phrase_status_rules(
         (next_status, captured_at, ruleset_id, template),
     )
     return (next_status == "accepted", next_status == "rejected")
+
+
+def get_ruleset_metrics(con: sqlite3.Connection, *, short_token_threshold: int = 4) -> list[dict[str, object]]:
+    rulesets = con.execute(
+        "SELECT DISTINCT ruleset_id FROM dsl_dictionary_patterns ORDER BY ruleset_id"
+    ).fetchall()
+    metrics: list[dict[str, object]] = []
+
+    for row in rulesets:
+        ruleset_id = int(row["ruleset_id"])
+        total = int(
+            con.execute(
+                "SELECT COUNT(*) AS c FROM dsl_dictionary_patterns WHERE ruleset_id=?",
+                (ruleset_id,),
+            ).fetchone()["c"]
+        )
+        count_one = int(
+            con.execute(
+                "SELECT COUNT(*) AS c FROM dsl_dictionary_patterns WHERE ruleset_id=? AND count=1",
+                (ruleset_id,),
+            ).fetchone()["c"]
+        )
+        short_count = int(
+            con.execute(
+                "SELECT COUNT(*) AS c FROM dsl_dictionary_patterns WHERE ruleset_id=? AND ((LENGTH(template)-LENGTH(REPLACE(template, ' ', '')))+1) <= ?",
+                (ruleset_id, short_token_threshold),
+            ).fetchone()["c"]
+        )
+
+        category_rows = [
+            dict(r)
+            for r in con.execute(
+                "SELECT category, COUNT(*) AS rows FROM dsl_dictionary_patterns WHERE ruleset_id=? GROUP BY category ORDER BY rows DESC",
+                (ruleset_id,),
+            ).fetchall()
+        ]
+        top_all = [
+            dict(r)
+            for r in con.execute(
+                "SELECT template, count FROM dsl_dictionary_patterns WHERE ruleset_id=? ORDER BY count DESC, template ASC LIMIT 20",
+                (ruleset_id,),
+            ).fetchall()
+        ]
+
+        def _top_by_category(category: str) -> list[dict[str, object]]:
+            return [
+                dict(r)
+                for r in con.execute(
+                    "SELECT template, count FROM dsl_dictionary_patterns WHERE ruleset_id=? AND category=? ORDER BY count DESC, template ASC LIMIT 20",
+                    (ruleset_id, category),
+                ).fetchall()
+            ]
+
+        metrics.append(
+            {
+                "ruleset_id": ruleset_id,
+                "total_rows": total,
+                "count_eq_1_rows": count_one,
+                "count_eq_1_ratio": (count_one / total) if total else 0.0,
+                "short_rows": short_count,
+                "short_ratio": (short_count / total) if total else 0.0,
+                "category_rows": category_rows,
+                "top20_all": top_all,
+                "top20_trigger": _top_by_category("trigger_patterns"),
+                "top20_action": _top_by_category("action_patterns"),
+            }
+        )
+
+    return metrics

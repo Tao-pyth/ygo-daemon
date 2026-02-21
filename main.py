@@ -34,7 +34,7 @@ from app.config import DB_PATH, load_app_config
 from app.usecase.dict_build import DictBuilderConfig, run_incremental_build
 from app.infra.migrate import apply_migrations
 from app.infra.table_dump import TableDumpError, dump_tables, parse_tables_arg, validate_tables
-from app.infra.repo_dict import set_latest_ruleset_id
+from app.infra.repo_dict import get_ruleset_metrics, set_latest_ruleset_id
 from app.orchestrator import execute_run_cycle
 
 
@@ -1017,6 +1017,14 @@ def cmd_dict_build(max_runtime_sec: Optional[int], batch_size: Optional[int], dr
             stats.rejected_phrases,
             stats.stop_reason,
         )
+        for metric in get_ruleset_metrics(con):
+            LOGGER.info(
+                "dict_metrics ruleset_id=%s total_rows=%s count_eq_1_ratio=%.3f short_ratio=%.3f",
+                metric["ruleset_id"],
+                metric["total_rows"],
+                metric["count_eq_1_ratio"],
+                metric["short_ratio"],
+            )
         if stats.stop_reason == "exception":
             return 1
         print(
