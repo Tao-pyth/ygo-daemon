@@ -5,6 +5,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from app.infra.lockfile import acquire_lock, now_iso, release_lock
 from app.infra.loggers import configure_logger
@@ -18,7 +19,7 @@ from app.infra.repo_dict import (
 )
 from app.service.dict_classify import detect_category
 from app.service.dict_promote import resolve_threshold
-from app.service.dict_text import TARGETS, ZONES, normalize_template, split_sentences
+from app.service.dict_text import TARGETS, normalize_template, split_sentences
 
 
 @dataclass(frozen=True)
@@ -43,17 +44,28 @@ class DictBuilderConfig:
     accept_thresholds: dict[str, int] = field(default_factory=dict)
 
 
-def _extract_card_sentences(raw_json: str) -> list[str]:
+def _extract_card_payload(raw_json: str) -> tuple[list[str], set[str], set[str]]:
     try:
         card = json.loads(raw_json)
     except json.JSONDecodeError:
-        return []
+        return ([], set(), set())
 
     desc = card.get("desc")
     if not isinstance(desc, str) or not desc.strip():
-        return []
+        return ([], set(), set())
 
-    return split_sentences(desc)
+    races = _extract_vocab_terms(card.get("race"))
+    attrs = _extract_vocab_terms(card.get("attribute"))
+
+    return (split_sentences(desc), races, attrs)
+
+
+def _extract_vocab_terms(value: Any) -> set[str]:
+    if isinstance(value, str) and value.strip():
+        return {value.strip()}
+    if isinstance(value, list):
+        return {str(item).strip() for item in value if str(item).strip()}
+    return set()
 
 
 def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> DictBuildStats:
@@ -93,7 +105,18 @@ def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> Di
 
             for row in rows:
                 captured_at = now_iso()
-                templates = [_t for sentence in _extract_card_sentences(row["json"]) if (_t := normalize_template(sentence))]
+                sentences, race_terms, attribute_terms = _extract_card_payload(row["json"])
+                templates = [
+                    _t
+                    for sentence in sentences
+                    if (
+                        _t := normalize_template(
+                            sentence,
+                            race_terms=race_terms,
+                            attribute_terms=attribute_terms,
+                        )
+                    )
+                ]
                 for template in templates:
                     decision = detect_category(template)
                     category = decision.category
@@ -132,17 +155,6 @@ def execute_dict_build(con: sqlite3.Connection, config: DictBuilderConfig) -> Di
 
                     logger.debug("dict_pattern_detected category=%s reason=%s template=%s", category, decision.reason, template)
 
-                    for zone, placeholder in ZONES.items():
-                        if placeholder in template:
-                            upsert_term(
-                                con,
-                                ruleset_id=latest_ruleset_id,
-                                term_type="zone_dictionary",
-                                normalized_term=zone,
-                                placeholder=placeholder,
-                                ruleset_version=config.ruleset_version,
-                                captured_at=captured_at,
-                            )
                     for target, placeholder in TARGETS.items():
                         if placeholder in template:
                             upsert_term(

@@ -3,17 +3,27 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from app.dict_builder import DictBuilderConfig, detect_category, normalize_template, run_incremental_build
+from app.dict_builder import DictBuilderConfig, detect_category, normalize_template, run_incremental_build, split_sentences
 
 
-def _insert_card(con: sqlite3.Connection, card_id: int, fetched_at: str, desc: str) -> None:
-    payload = '{"id": %d, "desc": "%s"}' % (card_id, desc.replace('"', '\\"'))
+def _insert_card(con: sqlite3.Connection, card_id: int, fetched_at: str, desc: str, *, race: str | None = None, attribute: str | None = None) -> None:
+    payload = {
+        "id": card_id,
+        "desc": desc,
+    }
+    if race is not None:
+        payload["race"] = race
+    if attribute is not None:
+        payload["attribute"] = attribute
+
+    import json
+
     con.execute(
         """
         INSERT INTO cards_raw(card_id, konami_id, json, content_hash, fetched_at, dbver_hash, source, fetch_status)
         VALUES(?, NULL, ?, ?, ?, NULL, 'queue', 'OK')
         """,
-        (card_id, payload, f"h-{card_id}", fetched_at),
+        (card_id, json.dumps(payload), f"h-{card_id}", fetched_at),
     )
     con.commit()
 
@@ -31,13 +41,23 @@ def _config(tmp_path: Path) -> DictBuilderConfig:
 
 
 def test_normalize_template_placeholders() -> None:
-    tpl = normalize_template("Add 2 monster from Deck to hand.")
-    assert tpl == "add {N} {TARGET_MONSTER} from {ZONE_DECK} to {ZONE_HAND}."
+    tpl = normalize_template('Add 2 monster from Deck to hand. Then reveal "Dark Magician".')
+    assert tpl == "add {NUM} {TARGET_MONSTER} from deck to hand. then reveal {CARDNAME}."
+
+
+def test_normalize_template_with_json_vocab_terms() -> None:
+    tpl = normalize_template("Target 1 LIGHT Spellcaster monster", race_terms={"Spellcaster"}, attribute_terms={"LIGHT"})
+    assert tpl == "target {NUM} {ATTRIBUTE} {RACE} {TARGET_MONSTER}"
+
+
+def test_split_sentences_keeps_connector_clause() -> None:
+    sentences = split_sentences("Draw 1 card. Then, and if you do, destroy it.")
+    assert len(sentences) == 1
 
 
 def test_detect_category_avoids_short_trigger_words() -> None:
     decision = detect_category("when")
-    assert decision.category == "condition_patterns"
+    assert decision.category == "unclassified_patterns"
 
 
 def test_dict_builder_incremental_only(temp_db: sqlite3.Connection, tmp_path: Path) -> None:
@@ -53,8 +73,6 @@ def test_dict_builder_incremental_only(temp_db: sqlite3.Connection, tmp_path: Pa
     third = run_incremental_build(temp_db, _config(tmp_path))
     assert third.processed_cards == 1
     assert third.new_phrases >= 1
-
-
 
 
 def test_dict_builder_reprocesses_when_latest_ruleset_changes(temp_db: sqlite3.Connection, tmp_path: Path) -> None:
@@ -75,6 +93,7 @@ def test_dict_builder_reprocesses_when_latest_ruleset_changes(temp_db: sqlite3.C
         "SELECT COUNT(*) AS c FROM dict_build_processed_cards WHERE card_id=500"
     ).fetchone()
     assert processed["c"] == 2
+
 
 def test_dict_builder_lock_skip(temp_db: sqlite3.Connection, tmp_path: Path) -> None:
     cfg = _config(tmp_path)
@@ -102,7 +121,7 @@ def test_candidate_promoted_to_accepted(temp_db: sqlite3.Connection, tmp_path: P
     run_incremental_build(temp_db, _config(tmp_path))
 
     row = temp_db.execute(
-        "SELECT status FROM dsl_dictionary_patterns WHERE ruleset_id=2 AND category='action_patterns' AND template='draw {N} {TARGET_CARD}.'"
+        "SELECT status FROM dsl_dictionary_patterns WHERE ruleset_id=2 AND category='action_patterns' AND template='draw {NUM} {TARGET_CARD}.'"
     ).fetchone()
     assert row is not None
     assert row["status"] == "accepted"
