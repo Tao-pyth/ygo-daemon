@@ -10,6 +10,7 @@ CommandHandler = Callable[[], int]
 QueueAddHandler = Callable[[int | None, str | None], int]
 DictBuildHandler = Callable[[int | None, int | None, bool, str | None], int]
 DumpHandler = Callable[[str | None, str, str], int]
+DictSetLatestRulesetHandler = Callable[[int], int]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,6 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dict_dump.add_argument("--out", type=str, required=True, help="出力ファイルパス")
     p_dict_dump.add_argument("--format", choices=["jsonl", "csv"], default="jsonl")
 
+    p_set_ruleset = sub.add_parser("dict-set-latest-ruleset", help="辞書生成の最新 ruleset_id を更新")
+    p_set_ruleset.add_argument("--id", type=int, required=True, dest="ruleset_id")
+
     p_db_dump = sub.add_parser("db-dump", help="管理テーブルを指定して全件ダンプ")
     p_db_dump.add_argument("--tables", type=str, required=True, help="カンマ区切りテーブル名")
     p_db_dump.add_argument("--out", type=str, required=True, help="出力ファイルパス")
@@ -76,6 +80,7 @@ def dispatch(
     cmd_dict_build: DictBuildHandler,
     cmd_dict_dump: DumpHandler,
     cmd_db_dump: DumpHandler,
+    cmd_dict_set_latest_ruleset: DictSetLatestRulesetHandler,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -92,4 +97,6 @@ def dispatch(
         return cmd_dict_dump(args.tables, args.out, args.format)
     if args.cmd == "db-dump":
         return cmd_db_dump(args.tables, args.out, args.format)
+    if args.cmd == "dict-set-latest-ruleset":
+        return cmd_dict_set_latest_ruleset(args.ruleset_id)
     return 2

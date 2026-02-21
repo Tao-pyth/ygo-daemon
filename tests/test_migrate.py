@@ -10,7 +10,7 @@ def test_apply_migrations_initializes_schema(tmp_path: Path) -> None:
     con = sqlite3.connect(tmp_path / "db.sqlite3")
     try:
         applied = apply_migrations(con, Path("app/db/migrations"))
-        assert applied == 7
+        assert applied == 8
 
         tables = {
             row[0]
@@ -28,11 +28,11 @@ def test_apply_migrations_initializes_schema(tmp_path: Path) -> None:
 def test_apply_migrations_is_idempotent(tmp_path: Path) -> None:
     con = sqlite3.connect(tmp_path / "db.sqlite3")
     try:
-        assert apply_migrations(con, Path("app/db/migrations")) == 7
+        assert apply_migrations(con, Path("app/db/migrations")) == 8
         assert apply_migrations(con, Path("app/db/migrations")) == 0
 
         count = con.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-        assert count == 7
+        assert count == 8
     finally:
         con.close()
 
@@ -65,5 +65,23 @@ def test_apply_migrations_rolls_back_on_failure(tmp_path: Path) -> None:
         }
         assert "t1" not in tables
         assert "t2" not in tables
+    finally:
+        con.close()
+
+
+def test_migration_0008_sets_latest_ruleset_and_processed_table(tmp_path: Path) -> None:
+    con = sqlite3.connect(tmp_path / "db.sqlite3")
+    con.row_factory = sqlite3.Row
+    try:
+        apply_migrations(con, Path("app/db/migrations"))
+
+        kv = con.execute("SELECT value FROM kv_store WHERE key='dict_build:latest_ruleset_id'").fetchone()
+        assert kv is not None
+        assert kv["value"] == "2"
+
+        table = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='dict_build_processed_cards'"
+        ).fetchone()
+        assert table is not None
     finally:
         con.close()
